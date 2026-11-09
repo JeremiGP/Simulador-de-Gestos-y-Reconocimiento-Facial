@@ -1,7 +1,7 @@
 using System;
 using OpenCvSharp;
 
-namespace GestureFaceSimulator.Infrastructure;
+namespace Stupipandi.Infrastructure;
 
 /// <summary>
 /// Proporciona operaciones optimizadas de preprocesamiento de imágenes (transformación a escala de grises,

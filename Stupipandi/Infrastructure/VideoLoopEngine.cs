@@ -3,7 +3,7 @@ using System.Diagnostics;
 using System.Threading;
 using OpenCvSharp;
 
-namespace GestureFaceSimulator.Infrastructure;
+namespace Stupipandi.Infrastructure;
 
 /// <summary>
 /// Orquestador del ciclo principal de adquisición de vídeo, despacho de eventos sincronizados y renderizado en pantalla.
@@ -24,14 +24,14 @@ public sealed class VideoLoopEngine : IDisposable
     /// <summary>
     /// Evento sincronizado emitido en cada ciclo con el fotograma original (bruto) adquirido.
     /// Diseñado para desacoplar y alimentar en tiempo real a los módulos de:
-    /// - Persona 2 (SkinSegmentation y GestureClassifier)
-    /// - Persona 3 (FaceDetector, FaceRecognizer y OverlayRenderer)
+    /// - Persona 2 (SkinSegmentation y GestureClassifier en Stupipandi.Gestures)
+    /// - Persona 3 (FaceDetector, FaceRecognizer y OverlayRenderer en Stupipandi.Biometrics)
     /// </summary>
     public event Action<Mat>? OnFrameReceived;
 
     /// <summary>
     /// Evento emitido cuando el usuario presiona una tecla en la ventana de OpenCV.
-    /// Permite a módulos de estado (ej. ApplicationStateManager de Persona 3) alternar modos de ejecución.
+    /// Permite a módulos de estado (ej. ApplicationStateManager en Stupipandi.State) alternar modos de ejecución.
     /// </summary>
     public event Action<char>? OnKeyPressed;
 
@@ -179,7 +179,6 @@ public sealed class VideoLoopEngine : IDisposable
 
     /// <summary>
     /// Libera los recursos del motor, cerrando ventanas gráficas y asegurando la detención del bucle.
-    /// Nota: La instancia de <see cref="CameraManager"/> puede ser liberada de forma independiente o aquí si se desea.
     /// </summary>
     public void Dispose()
     {

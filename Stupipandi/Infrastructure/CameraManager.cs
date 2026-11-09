@@ -1,7 +1,7 @@
 using System;
 using OpenCvSharp;
 
-namespace GestureFaceSimulator.Infrastructure;
+namespace Stupipandi.Infrastructure;
 
 /// <summary>
 /// Encapsula y gestiona el ciclo de vida del hardware de captura de vídeo (webcam integrada o dispositivos USB)
