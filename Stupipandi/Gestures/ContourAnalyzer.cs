@@ -114,7 +114,7 @@ public static class ContourAnalyzer
 
         var largestContour = contours
             .Where(contour => Cv2.ContourArea(contour) >= minimumArea)
-            .OrderByDescending(Cv2.ContourArea)
+            .OrderByDescending(contour => Cv2.ContourArea(contour))
             .FirstOrDefault();
 
         if (largestContour is null)
@@ -123,8 +123,9 @@ public static class ContourAnalyzer
         }
 
         var convexHull = Cv2.ConvexHull(largestContour);
-        var convexityDefects = convexHull.Length >= 3
-            ? Cv2.ConvexityDefects(largestContour, convexHull) ?? Array.Empty<Vec4i>()
+        var convexHullIndices = Cv2.ConvexHullIndices(largestContour);
+        var convexityDefects = convexHullIndices.Length >= 3
+            ? Cv2.ConvexityDefects(largestContour, convexHullIndices) ?? Array.Empty<Vec4i>()
             : Array.Empty<Vec4i>();
 
         return new ContourAnalysis(
