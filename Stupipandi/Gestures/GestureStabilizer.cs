@@ -9,7 +9,7 @@ namespace Stupipandi.Gestures;
 /// <summary>
 /// Motor de estabilización y reducción de jitter para el seguimiento y clasificación de gestos de mano.
 /// Implementa:
-/// 1. Suavizado espacial EMA del cuadro delimitador de la mano.
+/// 1. Suavizado espacial EMA del cuadro delimitador de la mano y de la punta del dedo índice.
 /// 2. Filtro de moda estadística sobre ventana deslizante temporal.
 /// 3. Debouncing con tiempo mínimo de mantenimiento para prevenir fluctuaciones erráticas.
 /// </summary>
@@ -21,6 +21,7 @@ public sealed class GestureStabilizer
 
     private readonly Queue<GestureType> _gestureHistory = new();
     private Rect? _smoothedHandRect;
+    private Point2f? _smoothedIndexTip;
     private GestureType _stableGesture = GestureType.None;
     private GestureType _candidateGesture = GestureType.None;
     private long _candidateFirstSeenTicks;
@@ -34,6 +35,14 @@ public sealed class GestureStabilizer
     /// Cuadro delimitador suavizado de la mano.
     /// </summary>
     public Rect? SmoothedHandRect => _smoothedHandRect;
+
+    /// <summary>
+    /// Coordenada suavizada de la punta del dedo índice para apuntado y mira técnica.
+    /// </summary>
+    public Point? SmoothedIndexFingerTip =>
+        _smoothedIndexTip.HasValue
+            ? new Point((int)Math.Round(_smoothedIndexTip.Value.X), (int)Math.Round(_smoothedIndexTip.Value.Y))
+            : null;
 
     /// <summary>
     /// Inicializa una nueva instancia de <see cref="GestureStabilizer"/>.
@@ -52,9 +61,9 @@ public sealed class GestureStabilizer
     }
 
     /// <summary>
-    /// Procesa el análisis de contorno y gesto crudo del fotograma actual, devolviendo el gesto estabilizado.
+    /// Procesa el análisis de contorno y gesto crudo del fotograma actual, devolviendo el gesto y coordenadas estabilizadas.
     /// </summary>
-    public (GestureType Gesture, Rect? HandBox) Update(
+    public (GestureType Gesture, Rect? HandBox, Point? IndexTip) Update(
         ContourAnalysis? rawAnalysis,
         GestureType rawGesture,
         int frameWidth,
@@ -62,7 +71,7 @@ public sealed class GestureStabilizer
     {
         long nowTicks = Stopwatch.GetTimestamp();
 
-        // ── 1. Suavizado espacial de caja de mano ─────────────────────────────
+        // ── 1. Suavizado espacial de caja de mano y punta de índice ──────────
         if (rawAnalysis is not null)
         {
             Rect newBox = rawAnalysis.BoundingBox;
@@ -83,10 +92,31 @@ public sealed class GestureStabilizer
             {
                 _smoothedHandRect = ClampToFrame(newBox, frameWidth, frameHeight);
             }
+
+            // Suavizado EMA de la punta del índice para High Noon
+            if (rawAnalysis.IndexFingerTip.HasValue)
+            {
+                Point rawTip = rawAnalysis.IndexFingerTip.Value;
+                if (_smoothedIndexTip.HasValue)
+                {
+                    float tx = (float)(_spatialAlpha * rawTip.X + (1.0 - _spatialAlpha) * _smoothedIndexTip.Value.X);
+                    float ty = (float)(_spatialAlpha * rawTip.Y + (1.0 - _spatialAlpha) * _smoothedIndexTip.Value.Y);
+                    _smoothedIndexTip = new Point2f(tx, ty);
+                }
+                else
+                {
+                    _smoothedIndexTip = new Point2f(rawTip.X, rawTip.Y);
+                }
+            }
+            else
+            {
+                _smoothedIndexTip = null;
+            }
         }
         else
         {
             _smoothedHandRect = null;
+            _smoothedIndexTip = null;
         }
 
         // ── 2. Ventana temporal de clasificación ─────────────────────────────
@@ -106,7 +136,6 @@ public sealed class GestureStabilizer
         int dominantCount = dominant.Count();
 
         // ── 3. Lógica de debouncing y persistencia ───────────────────────────
-        // Si el gesto dominante tiene al menos 55% de presencia en la ventana
         if (dominantCount >= Math.Ceiling(_historyWindowSize * 0.55))
         {
             if (dominantGesture != _stableGesture)
@@ -118,7 +147,6 @@ public sealed class GestureStabilizer
                 }
                 else
                 {
-                    // Si el candidato se ha sostenido durante el período de debounce
                     if (nowTicks - _candidateFirstSeenTicks >= _debounceTicks)
                     {
                         _stableGesture = dominantGesture;
@@ -131,7 +159,7 @@ public sealed class GestureStabilizer
             }
         }
 
-        return (_stableGesture, _smoothedHandRect);
+        return (_stableGesture, _smoothedHandRect, SmoothedIndexFingerTip);
     }
 
     /// <summary>
@@ -141,6 +169,7 @@ public sealed class GestureStabilizer
     {
         _gestureHistory.Clear();
         _smoothedHandRect = null;
+        _smoothedIndexTip = null;
         _stableGesture = GestureType.None;
         _candidateGesture = GestureType.None;
         _candidateFirstSeenTicks = 0;
