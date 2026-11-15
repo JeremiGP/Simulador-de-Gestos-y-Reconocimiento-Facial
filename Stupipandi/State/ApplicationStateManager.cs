@@ -1,7 +1,7 @@
 using System;
-using GestureFaceSimulator.Biometrics;
+using Stupipandi.Biometrics;
 
-namespace GestureFaceSimulator.State;
+namespace Stupipandi.State;
 
 public enum ApplicationMode
 {
@@ -17,30 +17,29 @@ public sealed class ApplicationStateChangedEventArgs : EventArgs
     public ApplicationStateChangedEventArgs(
         ApplicationMode previousMode,
         ApplicationMode currentMode,
-        string? currentUser)
+        string?         currentUser)
     {
         PreviousMode = previousMode;
-        CurrentMode = currentMode;
-        CurrentUser = currentUser;
+        CurrentMode  = currentMode;
+        CurrentUser  = currentUser;
     }
 
     public ApplicationMode PreviousMode { get; }
-    public ApplicationMode CurrentMode { get; }
-    public string? CurrentUser { get; }
+    public ApplicationMode CurrentMode  { get; }
+    public string?         CurrentUser  { get; }
 }
 
 /// <summary>
 /// Controla el paso de autenticación facial a interacción por gestos.
-/// No depende del enum GestureType de Persona 2: admite cualquier enum o string.
 /// </summary>
 public sealed class ApplicationStateManager
 {
     public ApplicationMode CurrentMode { get; private set; } = ApplicationMode.AwaitingFace;
-    public string? CurrentUser { get; private set; }
-    public string? LastGesture { get; private set; }
+    public string?         CurrentUser { get; private set; }
+    public string?         LastGesture { get; private set; }
 
     public event EventHandler<ApplicationStateChangedEventArgs>? StateChanged;
-    public event Action<string>? GestureAccepted;
+    public event Action<string>?                                  GestureAccepted;
 
     /// <summary>
     /// Actualiza el estado con el resultado de reconocer el rostro actual.
@@ -75,7 +74,6 @@ public sealed class ApplicationStateManager
 
     /// <summary>
     /// Acepta el gesto únicamente cuando hay una persona autenticada.
-    /// Persona 2 puede pasar su GestureType mediante gesture.ToString().
     /// </summary>
     public bool TryProcessGesture(string? gesture)
     {
@@ -88,7 +86,7 @@ public sealed class ApplicationStateManager
     }
 
     /// <summary>
-    /// Sobrecarga para usar directamente el enum GestureType de Persona 2.
+    /// Sobrecarga para usar directamente cualquier enum de gesto.
     /// </summary>
     public bool TryProcessGesture<TGesture>(TGesture gesture)
         where TGesture : struct, Enum
@@ -102,10 +100,7 @@ public sealed class ApplicationStateManager
         SetState(ApplicationMode.AwaitingFace, null);
     }
 
-    public void Exit()
-    {
-        SetState(ApplicationMode.Exiting, null);
-    }
+    public void Exit() => SetState(ApplicationMode.Exiting, null);
 
     private void SetState(ApplicationMode newMode, string? user)
     {
@@ -116,8 +111,7 @@ public sealed class ApplicationStateManager
         CurrentMode = newMode;
         CurrentUser = user;
 
-        StateChanged?.Invoke(
-            this,
+        StateChanged?.Invoke(this,
             new ApplicationStateChangedEventArgs(previousMode, newMode, user));
     }
 }

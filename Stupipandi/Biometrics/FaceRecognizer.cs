@@ -6,7 +6,7 @@ using System.Runtime.InteropServices;
 using System.Xml.Serialization;
 using OpenCvSharp;
 
-namespace GestureFaceSimulator.Biometrics;
+namespace Stupipandi.Biometrics;
 
 /// <summary>
 /// Resultado de la comparación de un rostro con las muestras guardadas.
@@ -25,9 +25,9 @@ public sealed record FaceRecognitionResult(
 /// </summary>
 public sealed class FaceRecognizer
 {
-    private const int FaceWidth = 64;
-    private const int FaceHeight = 64;
-    private const int FeatureLength = FaceWidth * FaceHeight;
+    private const int FaceWidth       = 64;
+    private const int FaceHeight      = 64;
+    private const int FeatureLength   = FaceWidth * FaceHeight;
     private const int CurrentModelVersion = 1;
 
     private readonly List<FaceSample> _samples = new();
@@ -42,12 +42,11 @@ public sealed class FaceRecognizer
 
     /// <summary>
     /// Distancia máxima para considerar que una muestra corresponde a una persona.
-    /// Debe ajustarse probando con la cámara y la iluminación reales.
     /// </summary>
     public double Threshold { get; set; }
 
-    public bool IsTrained => _samples.Count > 0;
-    public int SampleCount => _samples.Count;
+    public bool IsTrained   => _samples.Count > 0;
+    public int  SampleCount => _samples.Count;
 
     /// <summary>
     /// Añade una muestra. faceImage debe contener principalmente el rostro,
@@ -97,8 +96,8 @@ public sealed class FaceRecognizer
             return new FaceRecognitionResult(false, "Desconocido", double.PositiveInfinity, true);
 
         byte[] currentFeatures = ExtractFeatures(faceImage);
-        double bestDistance = double.PositiveInfinity;
-        string bestLabel = "Desconocido";
+        double bestDistance    = double.PositiveInfinity;
+        string bestLabel       = "Desconocido";
 
         foreach (FaceSample sample in _samples)
         {
@@ -106,7 +105,7 @@ public sealed class FaceRecognizer
             if (distance < bestDistance)
             {
                 bestDistance = distance;
-                bestLabel = sample.Label;
+                bestLabel    = sample.Label;
             }
         }
 
@@ -119,7 +118,7 @@ public sealed class FaceRecognizer
     }
 
     /// <summary>
-    /// Guarda las muestras en Assets/Models/face_model.xml (o en la ruta indicada).
+    /// Guarda las muestras en la ruta indicada (XML serializado).
     /// </summary>
     public void Save(string modelPath)
     {
@@ -128,7 +127,7 @@ public sealed class FaceRecognizer
         if (!IsTrained)
             throw new InvalidOperationException("No hay muestras; añade al menos un rostro antes de guardar el modelo.");
 
-        string fullPath = Path.GetFullPath(modelPath);
+        string fullPath  = Path.GetFullPath(modelPath);
         string? directory = Path.GetDirectoryName(fullPath);
         if (!string.IsNullOrEmpty(directory))
             Directory.CreateDirectory(directory);
@@ -138,7 +137,7 @@ public sealed class FaceRecognizer
             Version = CurrentModelVersion,
             Samples = _samples.Select(sample => new FaceSampleDocument
             {
-                Label = sample.Label,
+                Label    = sample.Label,
                 Features = sample.Features
             }).ToList()
         };
@@ -183,18 +182,12 @@ public sealed class FaceRecognizer
 
     private static byte[] ExtractFeatures(Mat faceImage)
     {
-        using Mat gray = FaceImageTools.ToGray(faceImage);
+        using Mat gray     = FaceImageTools.ToGray(faceImage);
         using var equalized = new Mat();
-        using var resized = new Mat();
+        using var resized   = new Mat();
 
         Cv2.EqualizeHist(gray, equalized);
-        Cv2.Resize(
-            equalized,
-            resized,
-            new Size(FaceWidth, FaceHeight),
-            0,
-            0,
-            InterpolationFlags.Area);
+        Cv2.Resize(equalized, resized, new Size(FaceWidth, FaceHeight), 0, 0, InterpolationFlags.Area);
 
         var features = new byte[FeatureLength];
         Marshal.Copy(resized.Data, features, 0, features.Length);
@@ -207,17 +200,16 @@ public sealed class FaceRecognizer
         for (int i = 0; i < FeatureLength; i++)
         {
             int difference = first[i] - second[i];
-            sumOfSquares += (long)difference * difference;
+            sumOfSquares  += (long)difference * difference;
         }
-
         return Math.Sqrt(sumOfSquares / (double)FeatureLength);
     }
 
     private static Rect ClipRectangle(Rect rectangle, int imageWidth, int imageHeight)
     {
-        int x = Math.Clamp(rectangle.X, 0, imageWidth);
-        int y = Math.Clamp(rectangle.Y, 0, imageHeight);
-        int width = Math.Clamp(rectangle.Width, 0, imageWidth - x);
+        int x      = Math.Clamp(rectangle.X,      0, imageWidth);
+        int y      = Math.Clamp(rectangle.Y,      0, imageHeight);
+        int width  = Math.Clamp(rectangle.Width,  0, imageWidth  - x);
         int height = Math.Clamp(rectangle.Height, 0, imageHeight - y);
         return new Rect(x, y, width, height);
     }
@@ -259,15 +251,9 @@ internal static class FaceImageTools
         var gray = new Mat();
         switch (source.Channels())
         {
-            case 1:
-                source.CopyTo(gray);
-                break;
-            case 3:
-                Cv2.CvtColor(source, gray, ColorConversionCodes.BGR2GRAY);
-                break;
-            case 4:
-                Cv2.CvtColor(source, gray, ColorConversionCodes.BGRA2GRAY);
-                break;
+            case 1: source.CopyTo(gray); break;
+            case 3: Cv2.CvtColor(source, gray, ColorConversionCodes.BGR2GRAY);  break;
+            case 4: Cv2.CvtColor(source, gray, ColorConversionCodes.BGRA2GRAY); break;
             default:
                 gray.Dispose();
                 throw new ArgumentException("La imagen debe tener 1, 3 o 4 canales.", nameof(source));

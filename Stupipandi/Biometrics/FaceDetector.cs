@@ -1,138 +1,116 @@
 using System;
 using System.IO;
+using System.Linq;
 using OpenCvSharp;
 
-namespace GestureFaceSimulator.Biometrics;
+namespace Stupipandi.Biometrics;
 
 /// <summary>
-/// Detecta rostros y ojos usando clasificadores Haar de OpenCV.
-/// Las coordenadas devueltas están referidas al frame original.
+/// Encapsula de forma segura una instancia de <see cref="CascadeClassifier"/> de OpenCV.
+/// Resuelve de forma inteligente la ubicación de los archivos Haar cascade XML tanto
+/// en tiempo de desarrollo como en tiempo de ejecución empaquetada.
 /// </summary>
 public sealed class FaceDetector : IDisposable
 {
-    private readonly CascadeClassifier _faceCascade;
-    private readonly CascadeClassifier _eyeCascade;
+    private CascadeClassifier? _cascade;
     private bool _disposed;
 
-    public FaceDetector(string faceCascadePath, string eyeCascadePath)
+    public const string FaceCascadeFile    = "haarcascade_frontalface_default.xml";
+    public const string EyeCascadeFile     = "haarcascade_eye.xml";
+    public const string SmileCascadeFile   = "haarcascade_smile.xml";
+    public const string ProfileCascadeFile = "haarcascade_profileface.xml";
+
+    /// <summary>
+    /// Nombre del archivo cascade asignado.
+    /// </summary>
+    public string CascadeFileName { get; }
+
+    /// <summary>
+    /// Ruta absoluta resuelta del archivo de cascada si fue encontrado.
+    /// </summary>
+    public string? ResolvedPath { get; }
+
+    /// <summary>
+    /// Indica si el clasificador está listo para realizar detecciones.
+    /// </summary>
+    public bool IsLoaded => _cascade is not null && !_cascade.IsDisposed;
+
+    /// <summary>
+    /// Inicializa un nuevo detector cargando el archivo de cascada especificado.
+    /// </summary>
+    /// <param name="cascadeFileName">Nombre del archivo XML (por ejemplo, haarcascade_frontalface_default.xml).</param>
+    public FaceDetector(string cascadeFileName = FaceCascadeFile)
     {
-        if (string.IsNullOrWhiteSpace(faceCascadePath))
-            throw new ArgumentException("Indica la ruta del clasificador de rostros.", nameof(faceCascadePath));
-        if (string.IsNullOrWhiteSpace(eyeCascadePath))
-            throw new ArgumentException("Indica la ruta del clasificador de ojos.", nameof(eyeCascadePath));
-        if (!File.Exists(faceCascadePath))
-            throw new FileNotFoundException("No se encontró haarcascade_frontalface_default.xml.", faceCascadePath);
-        if (!File.Exists(eyeCascadePath))
-            throw new FileNotFoundException("No se encontró haarcascade_eye.xml.", eyeCascadePath);
+        CascadeFileName = cascadeFileName;
+        ResolvedPath = ResolveCascadePath(cascadeFileName);
 
-        CascadeClassifier? face = null;
-        CascadeClassifier? eye = null;
-
-        try
+        if (ResolvedPath is not null && File.Exists(ResolvedPath))
         {
-            face = new CascadeClassifier(faceCascadePath);
-            eye = new CascadeClassifier(eyeCascadePath);
-
-            if (face.Empty())
-                throw new InvalidDataException($"El clasificador facial no se pudo cargar: {faceCascadePath}");
-            if (eye.Empty())
-                throw new InvalidDataException($"El clasificador de ojos no se pudo cargar: {eyeCascadePath}");
-
-            _faceCascade = face!;
-            _eyeCascade = eye!;
+            var classifier = new CascadeClassifier();
+            if (classifier.Load(ResolvedPath) && !classifier.Empty())
+            {
+                _cascade = classifier;
+            }
+            else
+            {
+                classifier.Dispose();
+            }
         }
-        catch
+
+        if (_cascade is null)
         {
-            face?.Dispose();
-            eye?.Dispose();
-            throw;
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[FaceDetector] Advertencia: No se pudo inicializar la cascada '{cascadeFileName}'.");
+            Console.ResetColor();
         }
     }
 
     /// <summary>
-    /// Devuelve los rectángulos de los rostros encontrados en el frame.
+    /// Ejecuta la detección multiescala sobre la matriz proporcionada.
+    /// Devuelve un array vacío si el clasificador no está disponible o la imagen está vacía.
     /// </summary>
-    public Rect[] DetectFaces(Mat frame)
+    public Rect[] DetectMultiScale(
+        Mat image,
+        double scaleFactor = 1.1,
+        int minNeighbors = 3,
+        HaarDetectionTypes flags = HaarDetectionTypes.ScaleImage,
+        Size minSize = default,
+        Size maxSize = default)
     {
-        ThrowIfDisposed();
-        ArgumentNullException.ThrowIfNull(frame);
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (frame.Empty())
-            return Array.Empty<Rect>();
-
-        using Mat gray = FaceImageTools.ToGray(frame);
-        using var equalized = new Mat();
-        Cv2.EqualizeHist(gray, equalized);
-
-        return _faceCascade.DetectMultiScale(
-            equalized,
-            scaleFactor: 1.1,
-            minNeighbors: 5,
-            minSize: new Size(60, 60));
-    }
-
-    /// <summary>
-    /// Busca ojos dentro de un rostro y devuelve sus coordenadas absolutas en el frame.
-    /// </summary>
-    public Rect[] DetectEyes(Mat frame, Rect faceBounds)
-    {
-        ThrowIfDisposed();
-        ArgumentNullException.ThrowIfNull(frame);
-
-        if (frame.Empty())
-            return Array.Empty<Rect>();
-
-        Rect safeFace = ClipRectangle(faceBounds, frame.Cols, frame.Rows);
-        if (safeFace.Width <= 0 || safeFace.Height <= 0)
-            return Array.Empty<Rect>();
-
-        using Mat gray = FaceImageTools.ToGray(frame);
-        using Mat faceRegion = gray[safeFace].Clone();
-        using var equalized = new Mat();
-        Cv2.EqualizeHist(faceRegion, equalized);
-
-        Rect[] localEyes = _eyeCascade.DetectMultiScale(
-            equalized,
-            scaleFactor: 1.1,
-            minNeighbors: 3,
-            minSize: new Size(12, 12));
-
-        var absoluteEyes = new Rect[localEyes.Length];
-        for (int i = 0; i < localEyes.Length; i++)
+        if (_cascade is null || image is null || image.IsDisposed || image.Empty())
         {
-            Rect eye = localEyes[i];
-            absoluteEyes[i] = new Rect(
-                safeFace.X + eye.X,
-                safeFace.Y + eye.Y,
-                eye.Width,
-                eye.Height);
+            return [];
         }
 
-        return absoluteEyes;
+        return _cascade.DetectMultiScale(
+            image,
+            scaleFactor,
+            minNeighbors,
+            flags,
+            minSize,
+            maxSize);
     }
 
-    private static Rect ClipRectangle(Rect rectangle, int imageWidth, int imageHeight)
+    private static string? ResolveCascadePath(string fileName)
     {
-        int x = Math.Clamp(rectangle.X, 0, imageWidth);
-        int y = Math.Clamp(rectangle.Y, 0, imageHeight);
-        int width = Math.Clamp(rectangle.Width, 0, imageWidth - x);
-        int height = Math.Clamp(rectangle.Height, 0, imageHeight - y);
-        return new Rect(x, y, width, height);
-    }
+        string[] searchPaths = [
+            Path.Combine(AppContext.BaseDirectory, "Assets", "Cascades", fileName),
+            Path.Combine(AppContext.BaseDirectory, fileName),
+            Path.Combine(Directory.GetCurrentDirectory(), "Assets", "Cascades", fileName),
+            Path.Combine(Directory.GetCurrentDirectory(), "Stupipandi", "Assets", "Cascades", fileName),
+            fileName
+        ];
 
-    private void ThrowIfDisposed()
-    {
-        if (_disposed)
-            throw new ObjectDisposedException(nameof(FaceDetector));
+        return searchPaths.FirstOrDefault(File.Exists);
     }
 
     public void Dispose()
     {
-        if (_disposed)
-            return;
-
-        _faceCascade.Dispose();
-        _eyeCascade.Dispose();
+        if (_disposed) return;
         _disposed = true;
+        _cascade?.Dispose();
+        _cascade = null;
     }
 }
