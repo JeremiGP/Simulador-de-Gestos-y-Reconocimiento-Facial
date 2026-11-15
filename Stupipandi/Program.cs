@@ -1,6 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
+using System.Threading.Tasks;
 using OpenCvSharp;
 using Stupipandi.Biometrics;
 using Stupipandi.Gestures;
@@ -10,90 +10,84 @@ using Stupipandi.State;
 namespace Stupipandi;
 
 /// <summary>
-/// Punto de entrada del Simulador de Gestos y Reconocimiento Facial.
-///
-/// Arquitectura del flujo de procesamiento:
-///   VideoLoopEngine ──(OnFrameReceived)──► ProcessFrame()
-///                                              ├── FramePreprocessor (Grayscale + EqualizeHist)
-///                                              ├── FaceDetector (Detección de rostro)
-///                                              │     ├── FaceRecognizer (Predicción biométrica)
-///                                              │     ├── EyeDetector (Detección de ojos en ROI facial)
-///                                              │     └── SmileDetector (Detección de sonrisa)
-///                                              ├── SkinSegmentation (Máscara de piel HSV / YCrCb)
-///                                              │     └── Supresión de región facial
-///                                              ├── ContourAnalyzer (Contorno mayor y defectos de convexidad)
-///                                              ├── GestureClassifier (Clasificación de dedos / puño)
-///                                              ├── ApplicationStateManager (Máquina de estados de acceso)
-///                                              └── OverlayRenderer (HUD, badges y bounding boxes)
-///   VideoLoopEngine ──(OnKeyPressed)─────► HandleKey()
+/// Orquestador principal del Simulador de Gestos y Reconocimiento Facial (Stupipandi).
+/// Integra la canalización de visión artificial con motores de estabilización anti-jitter,
+/// reconocimiento biométrico facial por histéresis, análisis de expresiones faciales
+/// ampliadas y clasificación estabilizada de posturas manuales.
 /// </summary>
 internal sealed class Program : IDisposable
 {
-    // ── Módulos de visión y estado ───────────────────────────────────────────
-    private readonly CameraManager           _cameraManager     = new(cameraIndex: 0);
-    private readonly VideoLoopEngine         _loopEngine;
-    private readonly FaceDetector            _faceDetector      = new(FaceDetector.FaceCascadeFile);
-    private readonly FaceDetector            _eyeDetector       = new(FaceDetector.EyeCascadeFile);
-    private readonly FaceDetector            _smileDetector     = new(FaceDetector.SmileCascadeFile);
-    private readonly FaceRecognizer          _faceRecognizer    = new(threshold: 52.0);
-    private readonly GestureClassifier       _gestureClassifier = new();
-    private readonly OverlayRenderer         _overlayRenderer   = new();
-    private readonly ApplicationStateManager _stateManager      = new();
-    private readonly FpsCounter              _fpsCounter        = new(alpha: 0.08);
+    // ── Módulos de infraestructura y captura ─────────────────────────────────
+    private readonly CameraManager _cameraManager = new(cameraIndex: 0);
+    private readonly VideoLoopEngine _loopEngine;
+    private readonly FpsCounter _fpsCounter = new(alpha: 0.08);
+
+    // ── Módulos biométricos y clasificadores Haar ────────────────────────────
+    private readonly FaceDetector _faceDetector = new(FaceDetector.FaceCascadeFile);
+    private readonly FaceDetector _eyeDetector = new(FaceDetector.EyeCascadeFile);
+    private readonly FaceDetector _smileDetector = new(FaceDetector.SmileCascadeFile);
+    private readonly FaceRecognizer _faceRecognizer = new(threshold: 52.0);
+    private readonly FaceStabilizer _faceStabilizer = new(spatialAlpha: 0.28, votingWindowSize: 7, maxDropoutFrames: 4, baseThreshold: 52.0);
+    private readonly ExpressionAnalyzer _expressionAnalyzer;
+
+    // ── Módulos de gestos y segmentación ─────────────────────────────────────
+    private readonly GestureClassifier _gestureClassifier = new();
+    private readonly GestureStabilizer _gestureStabilizer = new(spatialAlpha: 0.30, historyWindowSize: 7, debounceMilliseconds: 160);
+
+    // ── Estado y renderizado ─────────────────────────────────────────────────
+    private readonly ApplicationStateManager _stateManager = new(faceLossGraceFrames: 10);
+    private readonly OverlayRenderer _overlayRenderer = new();
 
     // ── Configuración en tiempo de ejecución ─────────────────────────────────
     private SkinSegmentation.ColorSpace _activeColorSpace = SkinSegmentation.ColorSpace.Hsv;
-    private volatile string?            _activePrompt     = null;
-    private volatile int                _enrolmentTargetSamples = 0;
-    private string?                     _enrolmentName    = null;
-    private bool                        _disposed;
+    private volatile string? _activePrompt = null;
+    private volatile int _enrolmentTargetSamples = 0;
+    private string? _enrolmentName = null;
+    private bool _disposed;
 
-    // ── Ruta persistente del modelo ──────────────────────────────────────────
     private static string FaceModelPath =>
         Path.Combine(AppContext.BaseDirectory, "Assets", "Models", "face_model.xml");
 
-    // ── Constructor ─────────────────────────────────────────────────────────
     private Program()
     {
+        _expressionAnalyzer = new ExpressionAnalyzer(_eyeDetector, _smileDetector, historyWindowSize: 5);
         _loopEngine = new VideoLoopEngine(_cameraManager, "Stupipandi - Simulador de Gestos y Reconocimiento Facial");
 
-        // Suscripción a eventos del motor de vídeo
+        // Conectar eventos del ciclo de vídeo
         _loopEngine.OnFrameReceived += ProcessFrame;
         _loopEngine.OnKeyPressed    += HandleKey;
-        _loopEngine.OnLoopExited    += () => Console.WriteLine("\n[INFO] Ciclo de video finalizado correctamente.");
+        _loopEngine.OnLoopExited    += () => Console.WriteLine("\n[INFO] Bucle de video finalizado con éxito.");
 
-        // Notificaciones del hardware de captura
+        // Notificaciones de hardware
         _cameraManager.OnDeviceError += msg =>
             Console.Error.WriteLine($"[HARDWARE] {msg}");
 
-        // Registro de cambios de gestos
+        // Registro de cambios de gestos consolidados
         _gestureClassifier.GestureChanged += (_, e) =>
         {
-            if (e.Current != GestureType.Unknown)
+            if (e.Current != GestureType.None)
             {
                 string nombreGesto = OverlayRenderer.FormatGestureName(e.Current);
-                Console.WriteLine($"[GESTO] Detectado: {nombreGesto}");
+                Console.WriteLine($"[GESTO] Cambio a: {nombreGesto}");
             }
-            _stateManager.TryProcessGesture(e.Current);
         };
 
         // Registro de transiciones de estado
         _stateManager.StateChanged += (_, e) =>
         {
-            string usuarioInfo = e.CurrentUser is null ? string.Empty : $" | Usuario: {e.CurrentUser}";
+            string usuarioInfo = e.CurrentUser is null ? string.Empty : $" | Usuario: {e.CurrentUser} ({e.ConfidencePercent}% conf.)";
             Console.WriteLine($"[ESTADO] {e.PreviousMode} -> {e.CurrentMode}{usuarioInfo}");
         };
 
-        // Notificación de gestos aceptados en modo interactivo
+        // Notificación de gestos aceptados por la máquina de seguridad
         _stateManager.GestureAccepted += gesto =>
         {
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[INTERACCION] Gesto aceptado para usuario {_stateManager.CurrentUser}: {gesto}");
+            Console.WriteLine($"[INTERACCION AUTORIZADA] Gesto procesado para '{_stateManager.CurrentUser}': {gesto}");
             Console.ResetColor();
         };
     }
 
-    // ── Método Principal ─────────────────────────────────────────────────────
     private static int Main()
     {
         Console.Title = "Stupipandi - Simulador de Gestos y Reconocimiento Facial";
@@ -124,31 +118,30 @@ internal sealed class Program : IDisposable
         finally
         {
             Console.WriteLine("\nPresione cualquier tecla para cerrar...");
-            try { Console.ReadKey(intercept: true); } catch { /* sin consola interactiva */ }
+            try { Console.ReadKey(intercept: true); } catch { /* sin terminal interactiva */ }
         }
     }
 
-    // ── Inicialización del sistema ───────────────────────────────────────────
     private void Startup()
     {
-        // 1. Cargar cascadas de Haar
+        // 1. Diagnóstico de cascadas Haar
         LogCascadeStatus("Rostro frontal", _faceDetector);
-        LogCascadeStatus("Ojos",           _eyeDetector);
-        LogCascadeStatus("Sonrisa",        _smileDetector);
+        LogCascadeStatus("Ojos", _eyeDetector);
+        LogCascadeStatus("Sonrisa", _smileDetector);
 
-        // 2. Cargar modelo biométrico entrenado previamente si existe
+        // 2. Cargar modelo biométrico persistido
         try
         {
             if (_faceRecognizer.Load(FaceModelPath))
             {
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"[BIOMETRIA] Modelo facial cargado con exito ({_faceRecognizer.SampleCount} muestras registradas).");
+                Console.WriteLine($"[BIOMETRIA] Modelo facial cargado exitosamente ({_faceRecognizer.SampleCount} muestras enroladas).");
                 Console.ResetColor();
             }
             else
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("[BIOMETRIA] Sin modelo previo. Presione 'T' en la ventana para registrar su rostro.");
+                Console.WriteLine("[BIOMETRIA] Sin modelo previo. Presione 'T' para enrolar su rostro.");
                 Console.ResetColor();
             }
         }
@@ -157,10 +150,10 @@ internal sealed class Program : IDisposable
             Console.Error.WriteLine($"[BIOMETRIA] Advertencia al leer archivo de modelo: {ex.Message}");
         }
 
-        // 3. Iniciar hardware de cámara
+        // 3. Iniciar cámara
         _cameraManager.Start(requestedWidth: 1280, requestedHeight: 720);
-        Console.WriteLine($"[CAMARA] Dispositivo listo: {_cameraManager.FrameWidth}x{_cameraManager.FrameHeight}");
-        Console.WriteLine("[CONTROL] Controles: ESC/Q=Salir | T=Enrolar rostro | S=Guardar modelo | R=Reiniciar | C=Color");
+        Console.WriteLine($"[CAMARA] Dispositivo inicializado: {_cameraManager.FrameWidth}x{_cameraManager.FrameHeight}");
+        Console.WriteLine("[CONTROL] Atajos: ESC/Q=Salir | T=Enrolar rostro | S=Guardar modelo | R=Reiniciar | C=Color");
     }
 
     private static void LogCascadeStatus(string name, FaceDetector detector)
@@ -172,123 +165,115 @@ internal sealed class Program : IDisposable
         else
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"[CASCADA] {name}: NO DISPONIBLE (la funcionalidad operara degradada)");
+            Console.WriteLine($"[CASCADA] {name}: NO DISPONIBLE (operación degradada)");
             Console.ResetColor();
         }
     }
 
-    // ── Procesamiento por fotograma ──────────────────────────────────────────
     private void ProcessFrame(Mat frame)
     {
         _fpsCounter.Tick();
         double currentFps = _fpsCounter.Value;
 
-        // 1. Preprocesamiento optimizado (escala de grises + ecualización de histograma)
+        // ── 1. Pipeline de normalización de iluminación y contraste ──────────
         using Mat processed = FramePreprocessor.ProcessPipeline(frame);
 
-        // 2. Detección multiescala de rostros
-        Rect[] faces = _faceDetector.DetectMultiScale(
+        // ── 2. Detección multiescala del rostro ───────────────────────────────
+        Rect[] rawFaces = _faceDetector.DetectMultiScale(
             processed,
-            scaleFactor:  1.1,
+            scaleFactor: 1.1,
             minNeighbors: 5,
-            flags:        HaarDetectionTypes.ScaleImage,
-            minSize:      new Size(60, 60));
+            flags: HaarDetectionTypes.ScaleImage,
+            minSize: new Size(60, 60));
 
-        Rect? primaryFace = null;
+        Rect? rawPrimaryFace = rawFaces.Length > 0 ? rawFaces[0] : null;
+        FaceRecognitionResult? rawRecResult = null;
+        ExpressionResult? expressionResult = null;
 
-        if (faces.Length == 0)
+        // Si se detectó rostro crudo, obtener predicción biométrica
+        if (rawPrimaryFace.HasValue)
         {
-            _stateManager.OnNoFaceDetected();
-            _gestureClassifier.Reset();
+            Rect safeFace = ClampRect(rawPrimaryFace.Value, frame.Cols, frame.Rows);
+            using Mat faceCrop = processed[safeFace];
+            rawRecResult = _faceRecognizer.Predict(faceCrop);
+
+            // Muestreo si está en proceso de enrolamiento
+            CheckEnrolmentSample(faceCrop);
+        }
+
+        // ── 3. Estabilizador facial (Filtro espacial EMA + Histéresis + Votación) ─
+        FaceRecognitionResult stableRecResult = _faceStabilizer.Update(
+            rawPrimaryFace,
+            rawRecResult,
+            frame.Cols,
+            frame.Rows);
+
+        Rect? stableFaceRect = _faceStabilizer.CurrentSmoothedRect;
+
+        if (stableFaceRect.HasValue)
+        {
+            Rect clampedStable = ClampRect(stableFaceRect.Value, frame.Cols, frame.Rows);
+            using Mat faceRoi = processed[clampedStable];
+
+            // ── 4. Análisis de expresiones faciales y estados oculares ───────
+            expressionResult = _expressionAnalyzer.Analyze(faceRoi, clampedStable);
+
+            // ── 5. Actualizar máquina de estados de seguridad ─────────────────
+            _stateManager.UpdateFaceResult(stableRecResult);
+
+            // ── 6. Renderizado de capas faciales ──────────────────────────────
+            _overlayRenderer.DrawFace(frame, clampedStable, stableRecResult, expressionResult);
         }
         else
         {
-            primaryFace = faces[0];
-            Rect clampedFace = ClampRect(primaryFace.Value, frame.Cols, frame.Rows);
-            using Mat faceRoi = processed[clampedFace];
-
-            // 3. Reconocimiento biométrico del rostro
-            FaceRecognitionResult recResult = _faceRecognizer.Predict(faceRoi);
-            _stateManager.UpdateFaceResult(recResult);
-
-            // 4. Muestreo de enrolamiento activo (si el usuario presiono 'T')
-            CheckEnrolmentSample(faceRoi);
-
-            // 5. Detección de ojos (en la región superior del rostro)
-            List<Rect>? eyeRects = null;
-            if (_eyeDetector.IsLoaded)
-            {
-                int eyeRoiH = (int)(clampedFace.Height * 0.58);
-                using Mat eyeRegion = faceRoi[new Rect(0, 0, clampedFace.Width, eyeRoiH)];
-                Rect[] eyes = _eyeDetector.DetectMultiScale(
-                    eyeRegion,
-                    scaleFactor:  1.15,
-                    minNeighbors: 3,
-                    flags:        HaarDetectionTypes.ScaleImage,
-                    minSize:      new Size(16, 16),
-                    maxSize:      new Size((int)(clampedFace.Width * 0.42), (int)(eyeRoiH * 0.8)));
-
-                if (eyes.Length > 0)
-                {
-                    eyeRects = new List<Rect>(eyes.Length);
-                    foreach (Rect e in eyes)
-                    {
-                        eyeRects.Add(new Rect(primaryFace.Value.X + e.X, primaryFace.Value.Y + e.Y, e.Width, e.Height));
-                    }
-                }
-            }
-
-            // 6. Detección de sonrisa (en la región inferior del rostro)
-            bool isSmiling = false;
-            if (_smileDetector.IsLoaded)
-            {
-                int smileY = (int)(clampedFace.Height * 0.52);
-                int smileH = clampedFace.Height - smileY;
-                using Mat smileRegion = faceRoi[new Rect(0, smileY, clampedFace.Width, smileH)];
-                Rect[] smiles = _smileDetector.DetectMultiScale(
-                    smileRegion,
-                    scaleFactor:  1.18,
-                    minNeighbors: 18,
-                    flags:        HaarDetectionTypes.ScaleImage,
-                    minSize:      new Size(28, 16));
-                isSmiling = smiles.Length > 0;
-            }
-
-            // 7. Renderizado de capas faciales sobre el frame
-            foreach (Rect face in faces)
-            {
-                _overlayRenderer.DrawFace(frame, face, recResult, eyeRects, isSmiling);
-            }
+            _stateManager.OnNoFaceDetected();
+            _expressionAnalyzer.Reset();
         }
 
-        // 8. Detección de gestos mediante segmentación de piel
+        // ── 7. Segmentación de piel y clasificación de gestos ────────────────
         using (Mat skinMask = SkinSegmentation.CreateMask(frame, _activeColorSpace))
         {
-            // Supresión de región facial para evitar falsos positivos con la cabeza
-            foreach (Rect face in faces)
+            // Supresión de la región de la cabeza para evitar falsos positivos
+            if (stableFaceRect.HasValue)
             {
+                Rect face = stableFaceRect.Value;
                 Rect faceSuppression = ClampRect(
-                    new Rect(face.X - 12, face.Y - 12, face.Width + 24, face.Height + 24),
+                    new Rect(face.X - 14, face.Y - 14, face.Width + 28, face.Height + 28),
                     skinMask.Cols,
                     skinMask.Rows);
+
                 Cv2.Rectangle(skinMask, faceSuppression, Scalar.Black, -1);
             }
 
-            ContourAnalysis? contour = ContourAnalyzer.Analyze(skinMask, minimumArea: 6_000);
-            GestureType currentGesture = _gestureClassifier.Update(contour);
+            // Análisis geométrico de contorno
+            ContourAnalysis? contourAnalysis = ContourAnalyzer.Analyze(skinMask, minimumArea: 5_500);
+            GestureType rawGesture = _gestureClassifier.Classify(contourAnalysis);
 
-            if (contour is not null && currentGesture != GestureType.Unknown)
+            // ── 8. Estabilizador de gestos (Filtro de moda + Debouncing + Bbox EMA) ──
+            var (stableGesture, stableHandBox) = _gestureStabilizer.Update(
+                contourAnalysis,
+                rawGesture,
+                frame.Cols,
+                frame.Rows);
+
+            if (stableHandBox.HasValue && stableGesture != GestureType.None)
             {
-                _overlayRenderer.DrawGesture(frame, contour.BoundingBox, currentGesture);
+                _overlayRenderer.DrawGesture(frame, stableHandBox.Value, stableGesture);
+                _stateManager.TryProcessGesture(stableGesture);
+            }
+            else
+            {
+                _stateManager.TryProcessGesture(GestureType.None);
             }
         }
 
-        // 9. Renderizado del HUD informativo y atajos
+        // ── 9. Renderizado del HUD informativo y telemetría ──────────────────
         _overlayRenderer.DrawHud(
             frame,
             _stateManager.CurrentMode,
             currentFps,
             _stateManager.CurrentUser,
+            _stateManager.CurrentConfidence,
             _stateManager.LastGesture,
             _activeColorSpace.ToString().ToUpperInvariant(),
             _activePrompt);
@@ -306,15 +291,14 @@ internal sealed class Program : IDisposable
                 if (_enrolmentTargetSamples <= 0)
                 {
                     Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"[ENROLAMIENTO] Completado con exito para '{_enrolmentName}'. Total de muestras en memoria: {_faceRecognizer.SampleCount}.");
-                    Console.WriteLine("[ENROLAMIENTO] Presione 'S' para persistir el modelo a disco.");
+                    Console.WriteLine($"[ENROLAMIENTO] Completado con éxito para '{_enrolmentName}'. Total de muestras: {_faceRecognizer.SampleCount}.");
+                    Console.WriteLine("[ENROLAMIENTO] Presione 'S' para persistir el modelo en disco.");
                     Console.ResetColor();
 
                     _activePrompt = $"Enrolado con exito: {_enrolmentName}";
                     _enrolmentName = null;
 
-                    // Despejar el prompt tras 3 segundos
-                    System.Threading.Tasks.Task.Delay(3000).ContinueWith(_ => _activePrompt = null);
+                    Task.Delay(3000).ContinueWith(_ => _activePrompt = null);
                 }
                 else
                 {
@@ -330,7 +314,6 @@ internal sealed class Program : IDisposable
         }
     }
 
-    // ── Manejo interactivo de teclado ────────────────────────────────────────
     private void HandleKey(char key)
     {
         switch (char.ToUpperInvariant(key))
@@ -345,11 +328,13 @@ internal sealed class Program : IDisposable
 
             case 'R':
                 _stateManager.Reset();
-                _gestureClassifier.Reset();
+                _faceStabilizer.Reset();
+                _expressionAnalyzer.Reset();
+                _gestureStabilizer.Reset();
                 _fpsCounter.Reset();
                 _activePrompt = "Sistema reiniciado";
-                System.Threading.Tasks.Task.Delay(2000).ContinueWith(_ => _activePrompt = null);
-                Console.WriteLine("[CONTROL] Estado del sistema reiniciado.");
+                Task.Delay(2000).ContinueWith(_ => _activePrompt = null);
+                Console.WriteLine("[CONTROL] Estado y estabilizadores reiniciados.");
                 break;
 
             case 'C':
@@ -367,15 +352,15 @@ internal sealed class Program : IDisposable
         if (string.IsNullOrWhiteSpace(name))
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("[ENROLAMIENTO] Operacion cancelada: nombre vacio.");
+            Console.WriteLine("[ENROLAMIENTO] Operación cancelada: nombre vacío.");
             Console.ResetColor();
             return;
         }
 
         _enrolmentName = name;
-        _enrolmentTargetSamples = 5; // Adquiere 5 fotogramas consecutivos de rostro
-        _activePrompt = $"Registrando a '{name}'... Mantenga la mirada al frente";
-        Console.WriteLine($"[ENROLAMIENTO] Adquiriendo 5 muestras de '{name}'. Mire a la camara...");
+        _enrolmentTargetSamples = 5;
+        _activePrompt = $"Registrando a '{name}'... Mire al frente";
+        Console.WriteLine($"[ENROLAMIENTO] Adquiriendo 5 muestras de '{name}'. Mire fijamente a la cámara...");
     }
 
     private void SaveModel()
@@ -388,7 +373,7 @@ internal sealed class Program : IDisposable
             Console.ResetColor();
 
             _activePrompt = "Modelo guardado correctamente";
-            System.Threading.Tasks.Task.Delay(2000).ContinueWith(_ => _activePrompt = null);
+            Task.Delay(2000).ContinueWith(_ => _activePrompt = null);
         }
         catch (Exception ex)
         {
@@ -405,10 +390,10 @@ internal sealed class Program : IDisposable
             : SkinSegmentation.ColorSpace.Hsv;
 
         string csName = _activeColorSpace.ToString().ToUpperInvariant();
-        Console.WriteLine($"[COLOR] Espacio de color cambiado a: {csName}");
+        Console.WriteLine($"[COLOR] Espacio cromático cambiado a: {csName}");
 
-        _activePrompt = $"Espacio de color piel: {csName}";
-        System.Threading.Tasks.Task.Delay(1800).ContinueWith(_ => _activePrompt = null);
+        _activePrompt = $"Espacio piel: {csName}";
+        Task.Delay(1800).ContinueWith(_ => _activePrompt = null);
     }
 
     private static Rect ClampRect(Rect rect, int maxW, int maxH)
@@ -420,7 +405,6 @@ internal sealed class Program : IDisposable
         return new Rect(x, y, w, h);
     }
 
-    // ── Liberación de recursos ───────────────────────────────────────────────
     public void Dispose()
     {
         if (_disposed) return;
@@ -434,9 +418,9 @@ internal sealed class Program : IDisposable
         _faceDetector.Dispose();
         _eyeDetector.Dispose();
         _smileDetector.Dispose();
+        _expressionAnalyzer.Dispose();
     }
 
-    // ── Banner visual en consola ─────────────────────────────────────────────
     private static void PrintBanner()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;

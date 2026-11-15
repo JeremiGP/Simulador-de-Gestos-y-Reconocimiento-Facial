@@ -1,23 +1,26 @@
+using System;
 using OpenCvSharp;
 
 namespace Stupipandi.Gestures;
 
 /// <summary>
-/// Gestos reconocidos por el módulo de análisis de la mano.
+/// Catálogo ampliado de gestos reconocibles por el simulador.
 /// </summary>
 public enum GestureType
 {
-    Unknown,
+    None,
     Fist,
+    ThumbsUp,
     OneFinger,
     TwoFingers,
     ThreeFingers,
     FourFingers,
-    OpenHand
+    OpenHand,
+    Rock
 }
 
 /// <summary>
-/// Información publicada cuando cambia el gesto estable detectado.
+/// Argumentos emitidos cuando cambia el gesto estable detectado.
 /// </summary>
 public sealed class GestureChangedEventArgs : EventArgs
 {
@@ -28,107 +31,151 @@ public sealed class GestureChangedEventArgs : EventArgs
     }
 
     public GestureType Previous { get; }
-
     public GestureType Current { get; }
 }
 
 /// <summary>
-/// Traduce los defectos de convexidad del contorno a un gesto semántico.
+/// Clasificador geométrico determinista de posturas y gestos de la mano.
+/// Evalúa combinaciones de solidez, defectos interdigitales, elongación y relaciones de aspecto.
 /// </summary>
 public sealed class GestureClassifier
 {
-    private GestureType currentGesture = GestureType.Unknown;
+    private GestureType _currentGesture = GestureType.None;
 
     /// <summary>
-    /// Se produce únicamente cuando el gesto clasificado cambia.
+    /// Evento producido cuando el gesto clasificado cambia.
     /// </summary>
     public event EventHandler<GestureChangedEventArgs>? GestureChanged;
 
-    public GestureType CurrentGesture => currentGesture;
+    /// <summary>
+    /// Gesto clasificado actual.
+    /// </summary>
+    public GestureType CurrentGesture => _currentGesture;
 
     /// <summary>
-    /// Clasifica un análisis de contorno sin modificar el estado interno.
+    /// Clasifica una postura de mano basada en descriptores geométricos de contorno.
     /// </summary>
-    public GestureType Classify(
-        ContourAnalysis? analysis,
-        double minimumDefectDepthPixels = 10,
-        double maximumDefectAngleDegrees = 90)
+    /// <param name="analysis">Resultado del análisis de contorno (o null si no hay mano visible).</param>
+    /// <returns>Tipo de gesto clasificado.</returns>
+    public GestureType Classify(ContourAnalysis? analysis)
     {
         if (analysis is null)
         {
-            return GestureType.Unknown;
+            return GestureType.None;
         }
 
-        var defectCount = analysis.CountFingerDefects(
-            minimumDefectDepthPixels,
-            maximumDefectAngleDegrees);
+        int defects = analysis.FingerDefectCount;
+        double solidity = analysis.Solidity;
+        double ar = analysis.AspectRatio; // Alto / Ancho
 
-        // Un defecto separa dos dedos; por eso N defectos suelen representar N+1 dedos.
-        return defectCount switch
+        // ── 1. Mano abierta (4 o más defectos entre dedos, o 3 con baja solidez y buena dispersión) ──
+        if (defects >= 4 || (defects == 3 && solidity < 0.62 && ar < 1.35))
         {
-            0 => IsClosedFist(analysis)
-                ? GestureType.Fist
-                : GestureType.OneFinger,
-            1 => GestureType.TwoFingers,
-            2 => GestureType.ThreeFingers,
-            3 => GestureType.FourFingers,
-            _ => GestureType.OpenHand
-        };
+            return GestureType.OpenHand;
+        }
+
+        // ── 2. Cuatro dedos ──────────────────────────────────────────────────
+        if (defects == 3)
+        {
+            return GestureType.FourFingers;
+        }
+
+        // ── 3. Tres dedos ────────────────────────────────────────────────────
+        if (defects == 2)
+        {
+            // Evaluar si es el signo de Rock / Cuernos (dos dedos exteriores extendidos con valle profundo central)
+            if (IsRockSign(analysis))
+            {
+                return GestureType.Rock;
+            }
+
+            return GestureType.ThreeFingers;
+        }
+
+        // ── 4. Dos dedos (Paz / Victoria) ────────────────────────────────────
+        if (defects == 1)
+        {
+            // Si el defecto es un valle central profundo entre dedos en V
+            var mainDefect = analysis.ValidDefects[0];
+            if (mainDefect.AngleDegrees is >= 18.0 and <= 80.0 && solidity < 0.80)
+            {
+                return GestureType.TwoFingers;
+            }
+
+            // Si la solidez es alta y tiene extensión vertical marcada, puede ser pulgar o índice
+            if (solidity >= 0.78 && ar >= 1.25 && analysis.HasUpwardExtension())
+            {
+                return GestureType.ThumbsUp;
+            }
+
+            return GestureType.OneFinger;
+        }
+
+        // ── 5. Cero defectos (Puño cerrado, Pulgar arriba o 1 Dedo) ──────────
+        if (defects == 0)
+        {
+            // Puño cerrado: Forma compacta, alta solidez, relación de aspecto cercana a 1.0
+            if (solidity >= 0.82 && ar is >= 0.70 and <= 1.45)
+            {
+                return GestureType.Fist;
+            }
+
+            // Pulgar hacia arriba: Elongación vertical, protuberancia superior y solidez media-alta
+            if (ar >= 1.28 && analysis.HasUpwardExtension() && solidity >= 0.72)
+            {
+                return GestureType.ThumbsUp;
+            }
+
+            // Un dedo apuntando: Delgado y vertical con solidez moderada
+            if (ar >= 1.35 && solidity < 0.80)
+            {
+                return GestureType.OneFinger;
+            }
+
+            // Por defecto en cero defectos con alta solidez: Puño
+            if (solidity >= 0.75)
+            {
+                return GestureType.Fist;
+            }
+        }
+
+        return GestureType.None;
     }
 
     /// <summary>
-    /// Clasifica y publica el nuevo gesto si es diferente del anterior.
+    /// Clasifica y actualiza el gesto actual, disparando el evento si hay cambio.
     /// </summary>
-    public GestureType Update(
-        ContourAnalysis? analysis,
-        double minimumDefectDepthPixels = 10,
-        double maximumDefectAngleDegrees = 90)
+    public GestureType Update(ContourAnalysis? analysis)
     {
-        var detected = Classify(
-            analysis,
-            minimumDefectDepthPixels,
-            maximumDefectAngleDegrees);
+        GestureType detected = Classify(analysis);
 
-        if (detected == currentGesture)
+        if (detected != _currentGesture)
         {
-            return currentGesture;
+            GestureType previous = _currentGesture;
+            _currentGesture = detected;
+            GestureChanged?.Invoke(this, new GestureChangedEventArgs(previous, _currentGesture));
         }
 
-        var previous = currentGesture;
-        currentGesture = detected;
-        GestureChanged?.Invoke(
-            this,
-            new GestureChangedEventArgs(previous, currentGesture));
-
-        return currentGesture;
+        return _currentGesture;
     }
 
     /// <summary>
-    /// Restablece el estado a <see cref="GestureType.Unknown"/> y notifica el cambio.
+    /// Restablece el clasificador a estado <see cref="GestureType.None"/>.
     /// </summary>
     public void Reset() => Update(null);
 
-    private static bool IsClosedFist(ContourAnalysis analysis)
+    /// <summary>
+    /// Verifica si los defectos corresponden a la postura "Rock / Cuernos" (índice y meñique arriba, medio y anular doblados).
+    /// </summary>
+    private static bool IsRockSign(ContourAnalysis analysis)
     {
-        var hullArea = CalculateHullArea(analysis.ConvexHull);
-        if (hullArea <= double.Epsilon)
-        {
-            return true;
-        }
+        if (analysis.ValidDefects.Count < 1) return false;
 
-        // Una mano cerrada tiende a ser compacta; el umbral evita confundirla
-        // con una silueta abierta sin defectos válidos.
-        var solidity = analysis.Area / hullArea;
-        return solidity >= 0.88;
-    }
+        // Rock presenta un valle ancho y profundo en el centro
+        var deepestDefect = analysis.ValidDefects.OrderByDescending(d => d.DepthPixels).First();
+        bool hasWideValley = deepestDefect.AngleDegrees > 45.0 && deepestDefect.DepthPixels > 18.0;
 
-    private static double CalculateHullArea(IReadOnlyCollection<Point> hull)
-    {
-        if (hull.Count < 3)
-        {
-            return 0;
-        }
-
-        return Cv2.ContourArea(hull.ToArray());
+        // Los puntos superiores están en los extremos laterales del contorno
+        return hasWideValley && analysis.Solidity < 0.72 && analysis.AspectRatio >= 1.05;
     }
 }

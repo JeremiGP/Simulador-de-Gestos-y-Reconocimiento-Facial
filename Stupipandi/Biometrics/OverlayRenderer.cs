@@ -7,80 +7,78 @@ using Stupipandi.State;
 namespace Stupipandi.Biometrics;
 
 /// <summary>
-/// Dibuja los resultados biométricos, información de gestos y el HUD del simulador sobre el frame.
-/// Modifica el <see cref="Mat"/> recibido; no crea copias innecesarias ni libera el frame original.
+/// Motor gráfico de alto rendimiento para renderizar información de telemetría,
+/// cuadros delimitadores estabilizados, badges de expresiones faciales y HUD interactivo.
+/// Opera directamente sobre matrices BGR existentes sin copias de memoria innecesarias.
 /// </summary>
 public sealed class OverlayRenderer
 {
-    private static readonly Scalar ColorRecognized  = new(0, 220, 0);     // Verde brillante
-    private static readonly Scalar ColorUnknown     = new(40, 40, 230);   // Rojo
-    private static readonly Scalar ColorEye         = new(255, 200, 0);   // Cyan/Azul claro
-    private static readonly Scalar ColorSmile       = new(0, 255, 255);   // Amarillo
-    private static readonly Scalar ColorGesture     = new(0, 165, 255);   // Naranja
-    private static readonly Scalar ColorHudText     = new(255, 255, 255); // Blanco
-    private static readonly Scalar ColorHudMuted    = new(190, 190, 190); // Gris claro
+    private static readonly Scalar ColorRecognized  = new(50, 220, 50);    // Verde esmeralda
+    private static readonly Scalar ColorUnknown     = new(40, 40, 230);    // Rojo carmesí
+    private static readonly Scalar ColorWarning     = new(0, 215, 255);    // Amarillo dorado
+    private static readonly Scalar ColorEye         = new(255, 210, 40);   // Cyan cielo
+    private static readonly Scalar ColorGesture     = new(20, 160, 255);   // Naranja ámbar
+    private static readonly Scalar ColorWhite       = new(255, 255, 255);  // Blanco
+    private static readonly Scalar ColorMuted       = new(190, 190, 190);  // Gris claro
 
     /// <summary>
-    /// Dibuja el cuadro delimitador del rostro, la etiqueta de identificación con fondo de contraste,
-    /// los ojos detectados y el indicador de sonrisa.
+    /// Dibuja el recuadro facial estabilizado, etiqueta de usuario, porcentaje de confianza,
+    /// recuadros de ojos y badge de expresión facial.
     /// </summary>
     public void DrawFace(
         Mat frame,
         Rect faceBounds,
         FaceRecognitionResult result,
-        IReadOnlyList<Rect>? eyeBounds = null,
-        bool isSmiling = false)
+        ExpressionResult? expression = null)
     {
         ArgumentNullException.ThrowIfNull(frame);
         ArgumentNullException.ThrowIfNull(result);
-        if (frame.Empty()) return;
+        if (frame.Empty() || faceBounds.Width <= 0 || faceBounds.Height <= 0) return;
 
-        Scalar color = result.IsRecognized ? ColorRecognized : ColorUnknown;
+        Scalar mainColor = result.IsRecognized
+            ? ColorRecognized
+            : (!result.ModelIsReady ? ColorWarning : ColorUnknown);
 
-        // Cuadro del rostro
-        Cv2.Rectangle(frame, faceBounds, color, 2, LineTypes.AntiAlias);
+        // Cuadro del rostro con esquinas reforzadas
+        DrawStylizedBox(frame, faceBounds, mainColor, 2);
 
-        // Etiqueta superior
-        string label = result.Label;
-        if (double.IsFinite(result.Distance))
+        // Etiqueta superior de identidad
+        string labelText = result.Label;
+        if (result.IsRecognized && result.ConfidencePercent > 0)
         {
-            label += $" ({result.Distance:0.0})";
+            labelText += $" [{result.ConfidencePercent}%]";
+        }
+        else if (double.IsFinite(result.Distance))
+        {
+            labelText += $" (d={result.Distance:0.0})";
         }
 
-        if (isSmiling)
+        // Fondo de contraste superior
+        int textY = faceBounds.Y > 28 ? faceBounds.Y - 8 : faceBounds.Y + 24;
+        DrawPillText(frame, labelText, new Point(faceBounds.X, textY), mainColor, 0.55);
+
+        // Badge de expresión facial (si está disponible)
+        if (expression is not null && expression.Expression != FacialExpression.Neutral)
         {
-            label += "  [Sonrisa :-)]";
+            Scalar expColor = expression.Expression switch
+            {
+                FacialExpression.Smiling => ColorWarning,
+                FacialExpression.Surprised => ColorEye,
+                FacialExpression.EyesClosed => ColorMuted,
+                _ => ColorWhite
+            };
+
+            int expY = faceBounds.Bottom + 20;
+            if (expY < frame.Rows - 35)
+            {
+                DrawPillText(frame, expression.Label, new Point(faceBounds.X, expY), expColor, 0.50);
+            }
         }
-
-        // Fondo para que el texto sea perfectamente legible
-        int textY = faceBounds.Y > 26 ? faceBounds.Y - 8 : faceBounds.Y + 22;
-        var textSize = Cv2.GetTextSize(label, HersheyFonts.HersheySimplex, 0.55, 1, out int baseline);
-        var labelOrigin = new Point(Math.Max(0, faceBounds.X), Math.Max(18, textY));
-        var bgRect = new Rect(
-            labelOrigin.X - 2,
-            labelOrigin.Y - textSize.Height - 4,
-            textSize.Width + 6,
-            textSize.Height + baseline + 6);
-
-        // Clamping al frame
-        bgRect = ClampRect(bgRect, frame.Cols, frame.Rows);
-        Cv2.Rectangle(frame, bgRect, Scalar.Black, -1);
-        Cv2.Rectangle(frame, bgRect, color, 1);
-
-        Cv2.PutText(
-            frame,
-            label,
-            labelOrigin,
-            HersheyFonts.HersheySimplex,
-            0.55,
-            color,
-            1,
-            LineTypes.AntiAlias);
 
         // Detección de ojos dentro del rostro
-        if (eyeBounds is not null)
+        if (expression?.EyeBounds is not null)
         {
-            foreach (Rect eye in eyeBounds)
+            foreach (Rect eye in expression.EyeBounds)
             {
                 Cv2.Rectangle(frame, eye, ColorEye, 1, LineTypes.AntiAlias);
             }
@@ -88,43 +86,30 @@ public sealed class OverlayRenderer
     }
 
     /// <summary>
-    /// Dibuja el cuadro y nombre del gesto de la mano detectado.
+    /// Dibuja el cuadro estabilizado y la identificación del gesto de mano.
     /// </summary>
     public void DrawGesture(Mat frame, Rect handBounds, GestureType gesture)
     {
         ArgumentNullException.ThrowIfNull(frame);
-        if (frame.Empty() || gesture == GestureType.Unknown) return;
+        if (frame.Empty() || gesture == GestureType.None || handBounds.Width <= 0 || handBounds.Height <= 0) return;
 
-        Cv2.Rectangle(frame, handBounds, ColorGesture, 2, LineTypes.AntiAlias);
+        DrawStylizedBox(frame, handBounds, ColorGesture, 2);
 
         string gestureName = FormatGestureName(gesture);
+        int textY = Math.Max(20, handBounds.Y - 8);
 
-        int textY = Math.Max(18, handBounds.Y - 8);
-        var textSize = Cv2.GetTextSize(gestureName, HersheyFonts.HersheySimplex, 0.60, 2, out int baseline);
-        var bgRect = ClampRect(new Rect(handBounds.X, textY - textSize.Height - 4, textSize.Width + 6, textSize.Height + baseline + 4), frame.Cols, frame.Rows);
-
-        Cv2.Rectangle(frame, bgRect, Scalar.Black, -1);
-        Cv2.Rectangle(frame, bgRect, ColorGesture, 1);
-
-        Cv2.PutText(
-            frame,
-            gestureName,
-            new Point(bgRect.X + 3, bgRect.Y + textSize.Height + 2),
-            HersheyFonts.HersheySimplex,
-            0.60,
-            ColorGesture,
-            2,
-            LineTypes.AntiAlias);
+        DrawPillText(frame, $"Gesto: {gestureName}", new Point(handBounds.X, textY), ColorGesture, 0.58);
     }
 
     /// <summary>
-    /// Renders el HUD superior e inferior con estado del sistema, FPS, atajos y espacio de color activo.
+    /// Renderiza el HUD completo del simulador con barra de telemetría y barra de atajos.
     /// </summary>
     public void DrawHud(
         Mat frame,
         ApplicationMode mode,
         double fps,
         string? currentUser = null,
+        int userConfidence = 0,
         string? lastGesture = null,
         string? colorSpaceName = "HSV",
         string? activePrompt = null)
@@ -135,86 +120,137 @@ public sealed class OverlayRenderer
         int frameW = frame.Cols;
         int frameH = frame.Rows;
 
-        // Barra superior translúcida / oscura
+        // Barra superior de estado
         var topBar = new Rect(0, 0, frameW, 64);
-        Cv2.Rectangle(frame, topBar, new Scalar(25, 25, 25), -1);
-        Cv2.Line(frame, new Point(0, 64), new Point(frameW, 64), new Scalar(70, 70, 70), 1);
+        Cv2.Rectangle(frame, topBar, new Scalar(20, 20, 20), -1);
+        Cv2.Line(frame, new Point(0, 64), new Point(frameW, 64), new Scalar(60, 60, 60), 1);
 
-        // Indicador de modo
         (string modeText, Scalar modeColor) = mode switch
         {
             ApplicationMode.AwaitingFace =>
-                ("Esperando rostro en camara...", ColorHudMuted),
+                ("Esperando rostro en camara...", ColorMuted),
             ApplicationMode.GestureInteraction =>
-                ($"ACCESO CONCEDIDO: {currentUser ?? "Usuario"} (Interaccion activa)", ColorRecognized),
+                ($"ACCESO AUTORIZADO: {currentUser ?? "Usuario"} ({userConfidence}% conf.) - Interaccion Activa", ColorRecognized),
             ApplicationMode.AccessDenied =>
-                ("ACCESO DENEGADO: Rostro desconocido", ColorUnknown),
+                ("ACCESO DENEGADO: Rostro no registrado en el sistema", ColorUnknown),
             ApplicationMode.TrainingRequired =>
-                ("MODELO SIN ENTRENAR: Presione 'T' para enrolar su rostro", ColorSmile),
+                ("MODELO SIN ENTRENAR: Presione 'T' para enrolar su rostro", ColorWarning),
             ApplicationMode.Exiting =>
-                ("Cerrando simulador...", ColorHudMuted),
-            _ => (mode.ToString(), ColorHudMuted)
+                ("Cerrando aplicacion...", ColorMuted),
+            _ => (mode.ToString(), ColorMuted)
         };
 
-        // Círculo indicador de estado
-        Cv2.Circle(frame, new Point(18, 22), 6, modeColor, -1);
-        Cv2.PutText(frame, modeText, new Point(32, 27),
-            HersheyFonts.HersheySimplex, 0.58, modeColor, 2, LineTypes.AntiAlias);
+        // Indicador luminoso de estado
+        Cv2.Circle(frame, new Point(20, 22), 7, modeColor, -1);
+        Cv2.PutText(frame, modeText, new Point(36, 27),
+            HersheyFonts.HersheySimplex, 0.55, modeColor, 2, LineTypes.AntiAlias);
 
-        // Línea 2: FPS y Espacio de Color
-        string subInfo = $"FPS: {fps:0.0}   |   Color piel: {colorSpaceName}";
+        // Línea 2: FPS, espacio de color y último gesto aceptado
+        string subInfo = $"FPS: {fps:0.0}   |   Piel: {colorSpaceName}";
         if (!string.IsNullOrWhiteSpace(lastGesture) && mode == ApplicationMode.GestureInteraction)
         {
-            subInfo += $"   |   Ultimo gesto: {lastGesture}";
+            subInfo += $"   |   Gesto activo: {lastGesture}";
         }
 
         Cv2.PutText(frame, subInfo, new Point(14, 50),
-            HersheyFonts.HersheySimplex, 0.46, ColorHudText, 1, LineTypes.AntiAlias);
+            HersheyFonts.HersheySimplex, 0.44, ColorWhite, 1, LineTypes.AntiAlias);
 
-        // Banner inferior de atajos de teclado
+        // Barra inferior de atajos de teclado
         var botBar = new Rect(0, frameH - 26, frameW, 26);
-        Cv2.Rectangle(frame, botBar, new Scalar(20, 20, 20), -1);
-        Cv2.Line(frame, new Point(0, frameH - 26), new Point(frameW, frameH - 26), new Scalar(60, 60, 60), 1);
+        Cv2.Rectangle(frame, botBar, new Scalar(16, 16, 16), -1);
+        Cv2.Line(frame, new Point(0, frameH - 26), new Point(frameW, frameH - 26), new Scalar(50, 50, 50), 1);
 
-        string shortcuts = "ESC/Q: Salir  |  T: Enrolar rostro  |  S: Guardar modelo  |  R: Reiniciar  |  C: Cambiar espacio color";
+        string shortcuts = "ESC/Q: Salir  |  T: Enrolar rostro  |  S: Guardar modelo  |  R: Reiniciar  |  C: Espacio HSV/YCrCb";
         Cv2.PutText(frame, shortcuts, new Point(12, frameH - 8),
-            HersheyFonts.HersheySimplex, 0.42, ColorHudMuted, 1, LineTypes.AntiAlias);
+            HersheyFonts.HersheySimplex, 0.40, ColorMuted, 1, LineTypes.AntiAlias);
 
-        // Mensaje interactivo destacado si existe (ej. enrolando)
+        // Modal de notificación emergente (ej. enrolando)
         if (!string.IsNullOrWhiteSpace(activePrompt))
         {
-            var promptSize = Cv2.GetTextSize(activePrompt, HersheyFonts.HersheySimplex, 0.65, 2, out int pBaseline);
+            var pSize = Cv2.GetTextSize(activePrompt, HersheyFonts.HersheySimplex, 0.65, 2, out int pBaseline);
             var centerRect = new Rect(
-                (frameW - promptSize.Width) / 2 - 12,
-                (frameH - promptSize.Height) / 2 - 12,
-                promptSize.Width + 24,
-                promptSize.Height + pBaseline + 24);
+                (frameW - pSize.Width) / 2 - 16,
+                (frameH - pSize.Height) / 2 - 16,
+                pSize.Width + 32,
+                pSize.Height + pBaseline + 32);
+
             centerRect = ClampRect(centerRect, frameW, frameH);
 
-            Cv2.Rectangle(frame, centerRect, new Scalar(10, 10, 80), -1);
-            Cv2.Rectangle(frame, centerRect, ColorSmile, 2);
+            Cv2.Rectangle(frame, centerRect, new Scalar(12, 12, 70), -1);
+            Cv2.Rectangle(frame, centerRect, ColorWarning, 2);
             Cv2.PutText(
                 frame,
                 activePrompt,
-                new Point(centerRect.X + 12, centerRect.Y + promptSize.Height + 10),
+                new Point(centerRect.X + 16, centerRect.Y + pSize.Height + 12),
                 HersheyFonts.HersheySimplex,
                 0.65,
-                ColorHudText,
+                ColorWhite,
                 2,
                 LineTypes.AntiAlias);
         }
     }
 
+    /// <summary>
+    /// Traduce el enum de gestos a una denominación clara en español.
+    /// </summary>
     public static string FormatGestureName(GestureType gesture) => gesture switch
     {
         GestureType.Fist         => "Puno cerrado",
+        GestureType.ThumbsUp     => "Pulgar arriba",
         GestureType.OneFinger    => "1 Dedo (Indice)",
         GestureType.TwoFingers   => "2 Dedos (Paz / Victoria)",
         GestureType.ThreeFingers => "3 Dedos",
         GestureType.FourFingers  => "4 Dedos",
         GestureType.OpenHand     => "Mano abierta (5 dedos)",
-        _                        => "Desconocido"
+        GestureType.Rock         => "Signo del Rock / Cuernos",
+        _                        => "Ninguno"
     };
+
+    private static void DrawPillText(Mat frame, string text, Point origin, Scalar color, double fontScale)
+    {
+        var size = Cv2.GetTextSize(text, HersheyFonts.HersheySimplex, fontScale, 1, out int baseline);
+        var bgRect = new Rect(origin.X - 2, origin.Y - size.Height - 4, size.Width + 6, size.Height + baseline + 6);
+        bgRect = ClampRect(bgRect, frame.Cols, frame.Rows);
+
+        Cv2.Rectangle(frame, bgRect, new Scalar(15, 15, 15), -1);
+        Cv2.Rectangle(frame, bgRect, color, 1);
+
+        Cv2.PutText(
+            frame,
+            text,
+            new Point(bgRect.X + 3, bgRect.Y + size.Height + 2),
+            HersheyFonts.HersheySimplex,
+            fontScale,
+            color,
+            1,
+            LineTypes.AntiAlias);
+    }
+
+    private static void DrawStylizedBox(Mat frame, Rect box, Scalar color, int thickness)
+    {
+        box = ClampRect(box, frame.Cols, frame.Rows);
+        Cv2.Rectangle(frame, box, color, thickness, LineTypes.AntiAlias);
+
+        // Esquinas resaltadas de mira técnica
+        int cornerLen = Math.Min(box.Width / 4, Math.Min(box.Height / 4, 18));
+        int t = thickness + 1;
+
+        // Top-Left
+        Cv2.Line(frame, new Point(box.X, box.Y), new Point(box.X + cornerLen, box.Y), color, t);
+        Cv2.Line(frame, new Point(box.X, box.Y), new Point(box.X, box.Y + cornerLen), color, t);
+
+        // Top-Right
+        Cv2.Line(frame, new Point(box.Right, box.Y), new Point(box.Right - cornerLen, box.Y), color, t);
+        Cv2.Line(frame, new Point(box.Right, box.Y), new Point(box.Right, box.Y + cornerLen), color, t);
+
+        // Bottom-Left
+        Cv2.Line(frame, new Point(box.X, box.Bottom), new Point(box.X + cornerLen, box.Bottom), color, t);
+        Cv2.Line(frame, new Point(box.X, box.Bottom), new Point(box.X, box.Bottom - cornerLen), color, t);
+
+        // Bottom-Right
+        Cv2.Line(frame, new Point(box.Right, box.Bottom), new Point(box.Right - cornerLen, box.Bottom), color, t);
+        Cv2.Line(frame, new Point(box.Right, box.Bottom), new Point(box.Right, box.Bottom - cornerLen), color, t);
+    }
 
     private static Rect ClampRect(Rect rect, int maxW, int maxH)
     {

@@ -10,28 +10,47 @@ namespace Stupipandi.Biometrics;
 
 /// <summary>
 /// Resultado de la comparación de un rostro con las muestras guardadas.
-/// Distance es la distancia RMS entre vectores; cuanto menor, mayor similitud.
 /// </summary>
 public sealed record FaceRecognitionResult(
     bool IsRecognized,
     string Label,
     double Distance,
-    bool ModelIsReady);
+    bool ModelIsReady,
+    int ConfidencePercent = 0);
 
 /// <summary>
-/// Reconocedor sencillo por distancia vectorial.
-/// No necesita OpenCvSharp.Face/LBPH: normaliza cada cara a un vector de píxeles
-/// y compara la distancia RMS con las muestras enroladas.
+/// Reconocedor biométrico facial basado en comparación vectorial normalizada (RMS).
+/// Extrae descriptores dimensionales normalizados en escala de grises y ecualización de histograma
+/// para comparar la distancia euclidiana cuadrática media contra las plantillas enroladas.
 /// </summary>
 public sealed class FaceRecognizer
 {
-    private const int FaceWidth       = 64;
-    private const int FaceHeight      = 64;
-    private const int FeatureLength   = FaceWidth * FaceHeight;
+    private const int FaceWidth = 64;
+    private const int FaceHeight = 64;
+    private const int FeatureLength = FaceWidth * FaceHeight;
     private const int CurrentModelVersion = 1;
 
     private readonly List<FaceSample> _samples = new();
 
+    /// <summary>
+    /// Distancia máxima para considerar que una muestra corresponde a una persona.
+    /// </summary>
+    public double Threshold { get; set; }
+
+    /// <summary>
+    /// Indica si el modelo contiene al menos una plantilla biométrica válida.
+    /// </summary>
+    public bool IsTrained => _samples.Count > 0;
+
+    /// <summary>
+    /// Cantidad total de muestras enroladas en memoria.
+    /// </summary>
+    public int SampleCount => _samples.Count;
+
+    /// <summary>
+    /// Inicializa una nueva instancia de <see cref="FaceRecognizer"/>.
+    /// </summary>
+    /// <param name="threshold">Umbral de distancia RMS base para aceptación biométrica.</param>
     public FaceRecognizer(double threshold = 52.0)
     {
         if (threshold <= 0 || double.IsNaN(threshold) || double.IsInfinity(threshold))
@@ -41,20 +60,13 @@ public sealed class FaceRecognizer
     }
 
     /// <summary>
-    /// Distancia máxima para considerar que una muestra corresponde a una persona.
-    /// </summary>
-    public double Threshold { get; set; }
-
-    public bool IsTrained   => _samples.Count > 0;
-    public int  SampleCount => _samples.Count;
-
-    /// <summary>
-    /// Añade una muestra. faceImage debe contener principalmente el rostro,
-    /// no el frame completo de la cámara.
+    /// Añade una muestra facial asociada a una identidad al conjunto de datos.
     /// </summary>
     public void AddSample(Mat faceImage, string personName)
     {
         ArgumentNullException.ThrowIfNull(faceImage);
+        if (faceImage.IsDisposed)
+            throw new ObjectDisposedException(nameof(faceImage));
 
         string cleanName = personName?.Trim() ?? string.Empty;
         if (cleanName.Length == 0)
@@ -67,11 +79,13 @@ public sealed class FaceRecognizer
     }
 
     /// <summary>
-    /// Recorta un rostro desde el frame y lo añade como muestra de entrenamiento.
+    /// Recorta un rostro desde el fotograma completo y lo añade como muestra de entrenamiento.
     /// </summary>
     public void AddSampleFromFrame(Mat frame, Rect faceBounds, string personName)
     {
         ArgumentNullException.ThrowIfNull(frame);
+        if (frame.IsDisposed)
+            throw new ObjectDisposedException(nameof(frame));
         if (frame.Empty())
             throw new ArgumentException("El frame está vacío.", nameof(frame));
 
@@ -84,20 +98,20 @@ public sealed class FaceRecognizer
     }
 
     /// <summary>
-    /// Compara una cara con todas las muestras y devuelve la coincidencia más cercana.
+    /// Compara la imagen de entrada con todas las plantillas registradas y devuelve la coincidencia más cercana.
     /// </summary>
     public FaceRecognitionResult Predict(Mat faceImage)
     {
         ArgumentNullException.ThrowIfNull(faceImage);
+        if (faceImage.IsDisposed || faceImage.Empty())
+            return new FaceRecognitionResult(false, "Desconocido", double.PositiveInfinity, IsTrained, 0);
 
         if (!IsTrained)
-            return new FaceRecognitionResult(false, "Modelo sin entrenar", double.PositiveInfinity, false);
-        if (faceImage.Empty())
-            return new FaceRecognitionResult(false, "Desconocido", double.PositiveInfinity, true);
+            return new FaceRecognitionResult(false, "Modelo sin entrenar", double.PositiveInfinity, false, 0);
 
         byte[] currentFeatures = ExtractFeatures(faceImage);
-        double bestDistance    = double.PositiveInfinity;
-        string bestLabel       = "Desconocido";
+        double bestDistance = double.PositiveInfinity;
+        string bestLabel = "Desconocido";
 
         foreach (FaceSample sample in _samples)
         {
@@ -105,20 +119,25 @@ public sealed class FaceRecognizer
             if (distance < bestDistance)
             {
                 bestDistance = distance;
-                bestLabel    = sample.Label;
+                bestLabel = sample.Label;
             }
         }
 
         bool recognized = bestDistance <= Threshold;
+        int confidence = recognized
+            ? (int)Math.Clamp((1.0 - (bestDistance / Threshold)) * 100.0 + 10.0, 10.0, 100.0)
+            : 0;
+
         return new FaceRecognitionResult(
             recognized,
             recognized ? bestLabel : "Desconocido",
             bestDistance,
-            true);
+            true,
+            confidence);
     }
 
     /// <summary>
-    /// Guarda las muestras en la ruta indicada (XML serializado).
+    /// Guarda las muestras registradas en formato XML en el archivo especificado.
     /// </summary>
     public void Save(string modelPath)
     {
@@ -127,7 +146,7 @@ public sealed class FaceRecognizer
         if (!IsTrained)
             throw new InvalidOperationException("No hay muestras; añade al menos un rostro antes de guardar el modelo.");
 
-        string fullPath  = Path.GetFullPath(modelPath);
+        string fullPath = Path.GetFullPath(modelPath);
         string? directory = Path.GetDirectoryName(fullPath);
         if (!string.IsNullOrEmpty(directory))
             Directory.CreateDirectory(directory);
@@ -137,7 +156,7 @@ public sealed class FaceRecognizer
             Version = CurrentModelVersion,
             Samples = _samples.Select(sample => new FaceSampleDocument
             {
-                Label    = sample.Label,
+                Label = sample.Label,
                 Features = sample.Features
             }).ToList()
         };
@@ -148,7 +167,7 @@ public sealed class FaceRecognizer
     }
 
     /// <summary>
-    /// Carga el modelo. Devuelve false si el archivo todavía no existe.
+    /// Carga las muestras biométricas desde un archivo XML previo. Devuelve false si el archivo no existe.
     /// </summary>
     public bool Load(string modelPath)
     {
@@ -182,9 +201,9 @@ public sealed class FaceRecognizer
 
     private static byte[] ExtractFeatures(Mat faceImage)
     {
-        using Mat gray     = FaceImageTools.ToGray(faceImage);
+        using Mat gray = FaceImageTools.ToGray(faceImage);
         using var equalized = new Mat();
-        using var resized   = new Mat();
+        using var resized = new Mat();
 
         Cv2.EqualizeHist(gray, equalized);
         Cv2.Resize(equalized, resized, new Size(FaceWidth, FaceHeight), 0, 0, InterpolationFlags.Area);
@@ -200,16 +219,16 @@ public sealed class FaceRecognizer
         for (int i = 0; i < FeatureLength; i++)
         {
             int difference = first[i] - second[i];
-            sumOfSquares  += (long)difference * difference;
+            sumOfSquares += (long)difference * difference;
         }
         return Math.Sqrt(sumOfSquares / (double)FeatureLength);
     }
 
     private static Rect ClipRectangle(Rect rectangle, int imageWidth, int imageHeight)
     {
-        int x      = Math.Clamp(rectangle.X,      0, imageWidth);
-        int y      = Math.Clamp(rectangle.Y,      0, imageHeight);
-        int width  = Math.Clamp(rectangle.Width,  0, imageWidth  - x);
+        int x = Math.Clamp(rectangle.X, 0, imageWidth);
+        int y = Math.Clamp(rectangle.Y, 0, imageHeight);
+        int width = Math.Clamp(rectangle.Width, 0, imageWidth - x);
         int height = Math.Clamp(rectangle.Height, 0, imageHeight - y);
         return new Rect(x, y, width, height);
     }
@@ -231,29 +250,36 @@ public sealed class FaceRecognizer
         [XmlAttribute("label")]
         public string Label { get; set; } = string.Empty;
 
-        // XmlSerializer almacena byte[] como Base64 dentro del XML.
         [XmlElement("Features")]
         public byte[] Features { get; set; } = Array.Empty<byte>();
     }
 }
 
 /// <summary>
-/// Conversión común a escala de grises para el módulo biométrico.
+/// Conversión auxiliar de matrices de imagen a escala de grises.
 /// </summary>
 internal static class FaceImageTools
 {
     public static Mat ToGray(Mat source)
     {
         ArgumentNullException.ThrowIfNull(source);
+        if (source.IsDisposed)
+            throw new ObjectDisposedException(nameof(source));
         if (source.Empty())
             throw new ArgumentException("La imagen está vacía.", nameof(source));
 
         var gray = new Mat();
         switch (source.Channels())
         {
-            case 1: source.CopyTo(gray); break;
-            case 3: Cv2.CvtColor(source, gray, ColorConversionCodes.BGR2GRAY);  break;
-            case 4: Cv2.CvtColor(source, gray, ColorConversionCodes.BGRA2GRAY); break;
+            case 1:
+                source.CopyTo(gray);
+                break;
+            case 3:
+                Cv2.CvtColor(source, gray, ColorConversionCodes.BGR2GRAY);
+                break;
+            case 4:
+                Cv2.CvtColor(source, gray, ColorConversionCodes.BGRA2GRAY);
+                break;
             default:
                 gray.Dispose();
                 throw new ArgumentException("La imagen debe tener 1, 3 o 4 canales.", nameof(source));
