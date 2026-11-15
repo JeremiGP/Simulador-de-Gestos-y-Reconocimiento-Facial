@@ -22,7 +22,6 @@ internal sealed class Program : IDisposable
 
     // ── Módulos biométricos ──────────────────────────────────────────────────
     private readonly FaceDetector _faceDetector = new(FaceDetector.FaceCascadeFile);
-    private readonly FaceDetector _profileDetector = new(FaceDetector.ProfileFaceCascadeFile);
     private readonly FaceDetector _eyeDetector = new(FaceDetector.EyeCascadeFile);
     private readonly FaceDetector _smileDetector = new(FaceDetector.SmileCascadeFile);
     private readonly FaceRecognizer _faceRecognizer = new(threshold: 52.0);
@@ -43,6 +42,9 @@ internal sealed class Program : IDisposable
     private volatile string? _activePrompt = null;
     private volatile int _enrolmentTargetSamples = 0;
     private string? _enrolmentName = null;
+    private bool _hasHavaAudio;
+    private bool _hasHimnoAudio;
+    private bool _hasVideoAudio;
     private bool _disposed;
 
     private static string MediaDir =>
@@ -63,7 +65,6 @@ internal sealed class Program : IDisposable
         _cameraManager.OnDeviceError += msg =>
             Console.Error.WriteLine($"[HARDWARE] {msg}");
 
-        // Conectar audio y estados al activarse cualquiera de los 6 disparadores
         _stateManager.TriggerActivated += OnTriggerActivated;
         _stateManager.TriggerDeactivated += OnTriggerDeactivated;
 
@@ -79,7 +80,6 @@ internal sealed class Program : IDisposable
         Console.Title = "Stupipandi - Simulador AR de Gestos y Reconocimiento Facial";
         PrintBanner();
 
-        // Inicializar y verificar todos los assets en Assets/Media
         MediaInitializer.EnsureAssetsExist();
 
         using var app = new Program();
@@ -106,10 +106,11 @@ internal sealed class Program : IDisposable
 
     private void Startup()
     {
-        LogCascadeStatus("Rostro frontal", _faceDetector);
-        LogCascadeStatus("Rostro perfil", _profileDetector);
+        LogCascadeStatus("Rostros (Frontal + Perfil)", _faceDetector);
         LogCascadeStatus("Ojos", _eyeDetector);
         LogCascadeStatus("Sonrisa", _smileDetector);
+
+        PreloadAllMediaAudio();
 
         try
         {
@@ -122,7 +123,7 @@ internal sealed class Program : IDisposable
             else
             {
                 Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine("[BIOMETRIA] Sin modelo previo. Presione 'T' para enrolar su rostro (opcional para triggers AR).");
+                Console.WriteLine("[BIOMETRIA] Sin modelo previo. Presione 'T' para enrolar su rostro.");
                 Console.ResetColor();
             }
         }
@@ -136,10 +137,45 @@ internal sealed class Program : IDisposable
         Console.WriteLine("[CONTROL] ESC/Q=Salir | T=Enrolar | S=Guardar | R=Reiniciar | C=Color Piel | 1-6=Probar Trigger");
     }
 
+    private void PreloadAllMediaAudio()
+    {
+        string? havaFile = FindAudioFile("hava_nagila");
+        if (havaFile is not null)
+        {
+            _audioManager.Preload("hava", havaFile);
+            _hasHavaAudio = true;
+        }
+
+        string? himnoFile = FindAudioFile("himno_espana");
+        if (himnoFile is not null)
+        {
+            _audioManager.Preload("himno", himnoFile);
+            _hasHimnoAudio = true;
+        }
+
+        string videoMp4 = Path.Combine(MediaDir, "video_1.mp4");
+        if (File.Exists(videoMp4))
+        {
+            _audioManager.Preload("video", videoMp4);
+            _hasVideoAudio = true;
+        }
+    }
+
+    private static string? FindAudioFile(string baseName)
+    {
+        string mp3 = Path.Combine(MediaDir, $"{baseName}.mp3");
+        if (File.Exists(mp3)) return mp3;
+
+        string wav = Path.Combine(MediaDir, $"{baseName}.wav");
+        if (File.Exists(wav)) return wav;
+
+        return null;
+    }
+
     private static void LogCascadeStatus(string name, FaceDetector detector)
     {
         Console.WriteLine(detector.IsLoaded
-            ? $"[CASCADA] {name}: OK ({Path.GetFileName(detector.ResolvedPath)})"
+            ? $"[CASCADA] {name}: OK"
             : $"[CASCADA] {name}: NO DISPONIBLE");
     }
 
@@ -157,11 +193,30 @@ internal sealed class Program : IDisposable
                 break;
 
             case ActiveTrigger.Trigger5_SteepledFingertips:
-                PlayMediaAudio("hava_nagila", isHavaNagila: true, durationSeconds: 6.0);
+                if (_hasHavaAudio)
+                    _audioManager.PlayPreloaded("hava", durationSeconds: 6.0, stopOthers: true);
+                else
+                    _audioManager.PlayProceduralAnthem(isHavaNagila: true, durationSeconds: 6.0, stopOthers: true);
                 break;
 
             case ActiveTrigger.Trigger6_MilitarySalute:
-                PlayMediaAudio("himno_espana", isHavaNagila: false, durationSeconds: 8.3);
+                _audioManager.Stop();
+                _overlayRenderer.ResetAuxVideo();
+
+                // Reproducir simultáneamente el audio del vídeo y el himno
+                if (_hasVideoAudio)
+                {
+                    _audioManager.PlayPreloaded("video", durationSeconds: 8.3, stopOthers: false);
+                }
+
+                if (_hasHimnoAudio)
+                {
+                    _audioManager.PlayPreloaded("himno", durationSeconds: 8.3, stopOthers: false);
+                }
+                else
+                {
+                    _audioManager.PlayProceduralAnthem(isHavaNagila: false, durationSeconds: 8.3, stopOthers: false);
+                }
                 break;
         }
     }
@@ -178,25 +233,7 @@ internal sealed class Program : IDisposable
         else if (trigger is ActiveTrigger.Trigger5_SteepledFingertips or ActiveTrigger.Trigger6_MilitarySalute)
         {
             _audioManager.Stop();
-        }
-    }
-
-    private void PlayMediaAudio(string baseName, bool isHavaNagila, double durationSeconds)
-    {
-        string mp3Path = Path.Combine(MediaDir, $"{baseName}.mp3");
-        string wavPath = Path.Combine(MediaDir, $"{baseName}.wav");
-
-        if (File.Exists(mp3Path))
-        {
-            _audioManager.Play(mp3Path, durationSeconds);
-        }
-        else if (File.Exists(wavPath))
-        {
-            _audioManager.Play(wavPath, durationSeconds);
-        }
-        else
-        {
-            _audioManager.PlayProceduralAnthem(isHavaNagila, durationSeconds);
+            _overlayRenderer.ResetAuxVideo();
         }
     }
 
@@ -212,21 +249,41 @@ internal sealed class Program : IDisposable
         using Mat processed = FramePreprocessor.ProcessPipeline(frame);
 
         // 2. Detección multi-rostro (Frontal + Perfiles izquierdo y derecho)
-        var rawDetections = DetectAllFacesWithProfiles(processed);
-        var trackedFaces = _faceStabilizer.UpdateMultiFace(rawDetections, _expressionAnalyzer, processed, frame.Cols, frame.Rows);
+        IReadOnlyList<OrientedFace> orientedFaces = _faceDetector.DetectOrientedFaces(
+            processed,
+            scaleFactor: 1.12,
+            minNeighbors: 6,
+            minSize: new Size(95, 95));
+
+        FaceRecognitionResult? rawPrimaryRec = null;
+        if (orientedFaces.Count > 0)
+        {
+            Rect primaryRawRect = ClampRect(orientedFaces[0].Bounds, frame.Cols, frame.Rows);
+            using Mat faceCrop = processed[primaryRawRect];
+            rawPrimaryRec = _faceRecognizer.Predict(faceCrop);
+            CheckEnrolmentSample(faceCrop);
+        }
+
+        // 3. Estabilizador multi-rostro (EMA + Histéresis)
+        var (trackedFaces, primaryRecResult) = _faceStabilizer.Update(
+            orientedFaces,
+            rawPrimaryRec,
+            frame.Cols,
+            frame.Rows);
 
         Rect? primaryFaceRect = trackedFaces.Count > 0 ? trackedFaces[0].SmoothedBounds : null;
-        FaceRecognitionResult? primaryRecResult = null;
-        ExpressionResult? primaryExpression = trackedFaces.Count > 0 ? trackedFaces[0].LastExpression : null;
+        ExpressionResult? primaryExpression = null;
 
-        if (primaryFaceRect.HasValue)
+        if (trackedFaces.Count > 0)
         {
-            Rect safeFace = ClampRect(primaryFaceRect.Value, frame.Cols, frame.Rows);
-            using Mat faceCrop = processed[safeFace];
-            var rawRec = _faceRecognizer.Predict(faceCrop);
-            CheckEnrolmentSample(faceCrop);
+            for (int i = 0; i < trackedFaces.Count; i++)
+            {
+                Rect safeFace = ClampRect(trackedFaces[i].SmoothedBounds, frame.Cols, frame.Rows);
+                using Mat faceRoi = processed[safeFace];
+                trackedFaces[i].LastExpression = _expressionAnalyzer.Analyze(faceRoi, safeFace);
+            }
 
-            primaryRecResult = _faceStabilizer.Update(safeFace, rawRec, frame.Cols, frame.Rows);
+            primaryExpression = trackedFaces[0].LastExpression;
             _stateManager.UpdateFaceResult(primaryRecResult);
         }
         else
@@ -235,53 +292,50 @@ internal sealed class Program : IDisposable
             _expressionAnalyzer.Reset();
         }
 
-        // 3. Segmentación de piel suprimiendo todos los rostros detectados
-        using Mat skinMask = SkinSegmentation.CreateMask(frame, _activeColorSpace);
+        // 4. Segmentación de piel suprimiendo rostro y cuello
+        var facesToSuppress = trackedFaces.Select(tf => tf.SmoothedBounds).ToList();
+        using Mat skinMask = SkinSegmentation.CreateMask(frame, _activeColorSpace, facesToSuppress);
 
-        foreach (var tf in trackedFaces)
-        {
-            Rect f = tf.SmoothedBounds;
-            // Excluir cabeza y cuello para eliminar falsos positivos de dedos
-            Rect suppression = ClampRect(
-                new Rect(f.X - (int)(f.Width * 0.12), f.Y - (int)(f.Height * 0.15), (int)(f.Width * 1.24), (int)(f.Height * 1.45)),
-                skinMask.Cols,
-                skinMask.Rows);
+        // 5. Análisis de contornos y clasificación de gestos
+        ContourAnalysis? contourAnalysis = ContourAnalyzer.Analyze(skinMask);
+        GestureType rawGesture = _gestureClassifier.Classify(contourAnalysis, primaryFaceRect, skinMask);
 
-            Cv2.Rectangle(skinMask, suppression, Scalar.Black, -1);
-        }
+        var (activeGesture, stableHandBox, indexFingerTip) = _gestureStabilizer.Update(
+            contourAnalysis,
+            rawGesture,
+            frame.Cols,
+            frame.Rows);
 
-        // 4. Análisis de contornos y clasificación de gestos
-        var contours = ContourAnalyzer.AnalyzeAll(skinMask, minimumArea: 4_500);
-        var classification = _gestureClassifier.ClassifyMultiContour(contours, trackedFaces, frame.Size());
-        var stabilizedGesture = _gestureStabilizer.UpdateExtended(classification, frame.Cols, frame.Rows);
-
-        GestureType activeGesture = stabilizedGesture.Gesture;
-        Point? indexFingerTip = stabilizedGesture.IndexFingerTip;
-
-        // 5. Evaluar los 6 disparadores interactivos
+        // 6. Evaluar los 6 disparadores interactivos
         ActiveTrigger activeTrigger = _stateManager.EvaluateTriggers(trackedFaces, activeGesture, primaryExpression);
 
-        // 6. Renderizado de capas AR y efectos según el disparador activo
+        // 7. Renderizado de capas AR y efectos según el disparador activo
         if (activeTrigger == ActiveTrigger.Trigger4_PrayingPalms)
         {
-            using Mat fullSkinMask = SkinSegmentation.CreateMask(frame, _activeColorSpace);
+            using Mat fullSkinMask = SkinSegmentation.CreateMask(frame, _activeColorSpace, facesToSuppress: null);
             _overlayRenderer.ReplaceBackground(frame, fullSkinMask, primaryFaceRect, "jesus_bg.jpg");
         }
 
         // Dibujar recuadros faciales y expresiones
-        foreach (var tf in trackedFaces)
+        for (int i = 0; i < trackedFaces.Count; i++)
         {
-            var rec = (tf == trackedFaces[0] && primaryRecResult is not null)
+            var tf = trackedFaces[i];
+            var rec = (i == 0)
                 ? primaryRecResult
-                : new FaceRecognitionResult(false, "Persona", 0, double.PositiveInfinity, _faceRecognizer.SampleCount > 0);
+                : new FaceRecognitionResult(false, "Persona", double.PositiveInfinity, _faceRecognizer.IsTrained, 0);
 
             _overlayRenderer.DrawFace(frame, tf.SmoothedBounds, rec, tf.LastExpression);
         }
 
-        // Dibujar contorno de mano estabilizado
-        if (stabilizedGesture.SmoothedBounds.HasValue && activeGesture != GestureType.None)
+        // Dibujar contorno de mano estabilizado (o badge si son manos en la cabeza)
+        if (activeGesture == GestureType.HandsOnHead && primaryFaceRect.HasValue)
         {
-            _overlayRenderer.DrawGesture(frame, stabilizedGesture.SmoothedBounds.Value, activeGesture);
+            _overlayRenderer.DrawGesture(frame, primaryFaceRect.Value, activeGesture);
+            _stateManager.TryProcessGesture(activeGesture);
+        }
+        else if (stableHandBox.HasValue && activeGesture != GestureType.None)
+        {
+            _overlayRenderer.DrawGesture(frame, stableHandBox.Value, activeGesture);
             _stateManager.TryProcessGesture(activeGesture);
         }
         else
@@ -321,7 +375,7 @@ internal sealed class Program : IDisposable
                 break;
         }
 
-        // 7. Renderizado del HUD
+        // 8. Renderizado del HUD
         _overlayRenderer.DrawHud(
             frame,
             _stateManager.CurrentMode,
@@ -332,59 +386,6 @@ internal sealed class Program : IDisposable
             _activeColorSpace.ToString().ToUpperInvariant(),
             _activePrompt,
             activeTrigger);
-    }
-
-    private List<(Rect Bounds, FaceOrientation Orientation)> DetectAllFacesWithProfiles(Mat processedGray)
-    {
-        var results = new List<(Rect Bounds, FaceOrientation Orientation)>();
-
-        // 1. Rostros frontales
-        Rect[] frontals = _faceDetector.DetectMultiScale(processedGray, 1.1, 5, HaarDetectionTypes.ScaleImage, new Size(60, 60));
-        foreach (var r in frontals)
-        {
-            results.Add((r, FaceOrientation.Frontal));
-        }
-
-        // 2. Perfil derecho (imagen normal)
-        if (_profileDetector.IsLoaded)
-        {
-            Rect[] rightProfiles = _profileDetector.DetectMultiScale(processedGray, 1.1, 4, HaarDetectionTypes.ScaleImage, new Size(60, 60));
-            foreach (var r in rightProfiles)
-            {
-                if (!OverlapsExisting(results, r))
-                {
-                    results.Add((r, FaceOrientation.RightProfile));
-                }
-            }
-
-            // 3. Perfil izquierdo (imagen volteada horizontalmente)
-            using var flipped = new Mat();
-            Cv2.Flip(processedGray, flipped, FlipMode.Y);
-            Rect[] leftProfiles = _profileDetector.DetectMultiScale(flipped, 1.1, 4, HaarDetectionTypes.ScaleImage, new Size(60, 60));
-            foreach (var r in leftProfiles)
-            {
-                Rect unflipped = new(processedGray.Cols - r.X - r.Width, r.Y, r.Width, r.Height);
-                if (!OverlapsExisting(results, unflipped))
-                {
-                    results.Add((unflipped, FaceOrientation.LeftProfile));
-                }
-            }
-        }
-
-        return results;
-    }
-
-    private static bool OverlapsExisting(List<(Rect Bounds, FaceOrientation Orientation)> existing, Rect candidate)
-    {
-        foreach (var item in existing)
-        {
-            Rect inter = item.Bounds & candidate;
-            double interArea = inter.Width * inter.Height;
-            double minArea = Math.Min(item.Bounds.Width * item.Bounds.Height, candidate.Width * candidate.Height);
-            if (minArea > 0 && (interArea / minArea) > 0.35)
-                return true;
-        }
-        return false;
     }
 
     private void CheckEnrolmentSample(Mat faceRoi)
@@ -448,7 +449,6 @@ internal sealed class Program : IDisposable
                 Task.Delay(1500).ContinueWith(_ => _activePrompt = null);
                 break;
 
-            // Atajos de prueba directa de los 6 triggers (teclas 1..6)
             case '1': _stateManager.ActivateTrigger(ActiveTrigger.Trigger1_LionRoar, 5.0); break;
             case '2': _stateManager.ActivateTrigger(ActiveTrigger.Trigger2_HandsOnHead, 4.0); break;
             case '3': _stateManager.ActivateTrigger(ActiveTrigger.Trigger3_HighNoon, 15.0); break;
@@ -508,7 +508,6 @@ internal sealed class Program : IDisposable
         _loopEngine.Dispose();
         _cameraManager.Dispose();
         _faceDetector.Dispose();
-        _profileDetector.Dispose();
         _eyeDetector.Dispose();
         _smileDetector.Dispose();
         _expressionAnalyzer.Dispose();

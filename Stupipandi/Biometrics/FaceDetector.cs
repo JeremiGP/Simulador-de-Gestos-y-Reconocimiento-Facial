@@ -6,9 +6,6 @@ using OpenCvSharp;
 
 namespace Stupipandi.Biometrics;
 
-/// <summary>
-/// Orientación angular estimada del rostro en el espacio de la imagen.
-/// </summary>
 public enum FaceOrientation
 {
     Frontal,
@@ -16,25 +13,17 @@ public enum FaceOrientation
     LookingRight
 }
 
-/// <summary>
-/// Detección de rostro que incluye límites geométricos y orientación angular.
-/// </summary>
 public sealed record OrientedFace(Rect Bounds, FaceOrientation Orientation);
 
-/// <summary>
-/// Detector facial multiescala con soporte para rostros frontales y de perfil bilateral.
-/// Combina haarcascade_frontalface_default.xml con haarcascade_profileface.xml (en orientación directa
-/// y con inversión horizontal en espejo) para mantener el seguimiento ininterrumpido al girar la cabeza.
-/// </summary>
 public sealed class FaceDetector : IDisposable
 {
     private CascadeClassifier? _frontalCascade;
     private CascadeClassifier? _profileCascade;
     private bool _disposed;
 
-    public const string FaceCascadeFile    = "haarcascade_frontalface_default.xml";
-    public const string EyeCascadeFile     = "haarcascade_eye.xml";
-    public const string SmileCascadeFile   = "haarcascade_smile.xml";
+    public const string FaceCascadeFile = "haarcascade_frontalface_default.xml";
+    public const string EyeCascadeFile = "haarcascade_eye.xml";
+    public const string SmileCascadeFile = "haarcascade_smile.xml";
     public const string ProfileCascadeFile = "haarcascade_profileface.xml";
 
     public bool IsLoaded => (_frontalCascade is not null && !_frontalCascade.IsDisposed) ||
@@ -56,7 +45,6 @@ public sealed class FaceDetector : IDisposable
             }
         }
 
-        // Si es el detector principal de rostros, cargar también la cascada de perfil
         if (cascadeFileName == FaceCascadeFile)
         {
             string? profilePath = ResolveCascadePath(ProfileCascadeFile);
@@ -75,13 +63,10 @@ public sealed class FaceDetector : IDisposable
         }
     }
 
-    /// <summary>
-    /// Detecta rostros con información de orientación (Frontal, Perfil Izquierdo o Perfil Derecho).
-    /// </summary>
     public IReadOnlyList<OrientedFace> DetectOrientedFaces(
         Mat grayImage,
-        double scaleFactor = 1.1,
-        int minNeighbors = 4,
+        double scaleFactor = 1.12,
+        int minNeighbors = 6,
         Size minSize = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -91,19 +76,21 @@ public sealed class FaceDetector : IDisposable
             return Array.Empty<OrientedFace>();
         }
 
-        if (minSize == default) minSize = new Size(50, 50);
+        // Tamaño mínimo realista para un rostro en webcam (evita falsos positivos en ropa/cuello)
+        Size effectiveMinSize = new(Math.Max(95, minSize.Width), Math.Max(95, minSize.Height));
+        int effectiveNeighbors = Math.Max(6, minNeighbors);
 
         List<OrientedFace> candidates = new();
 
-        // 1. Detección frontal estándar
+        // 1. Detección frontal
         if (_frontalCascade is not null)
         {
             Rect[] frontals = _frontalCascade.DetectMultiScale(
                 grayImage,
                 scaleFactor,
-                minNeighbors,
+                effectiveNeighbors,
                 HaarDetectionTypes.ScaleImage,
-                minSize);
+                effectiveMinSize);
 
             foreach (var r in frontals)
             {
@@ -111,49 +98,44 @@ public sealed class FaceDetector : IDisposable
             }
         }
 
-        // 2. Detección de perfil si el clasificador está disponible
+        // 2. Detección de perfil con umbral más estricto (evita pliegues de ropa)
         if (_profileCascade is not null)
         {
-            // Perfil directo (convención OpenCV: suele detectar perfil derecho del sujeto, que mira a la derecha de la imagen)
+            int profileNeighbors = effectiveNeighbors + 2;
+
             Rect[] profilesNormal = _profileCascade.DetectMultiScale(
                 grayImage,
                 scaleFactor,
-                minNeighbors,
+                profileNeighbors,
                 HaarDetectionTypes.ScaleImage,
-                minSize);
+                effectiveMinSize);
 
             foreach (var r in profilesNormal)
             {
                 candidates.Add(new OrientedFace(r, FaceOrientation.LookingRight));
             }
 
-            // Perfil en espejo (invirtiendo horizontalmente la imagen para detectar el perfil opuesto)
             using var flipped = new Mat();
             Cv2.Flip(grayImage, flipped, FlipMode.Y);
 
             Rect[] profilesFlipped = _profileCascade.DetectMultiScale(
                 flipped,
                 scaleFactor,
-                minNeighbors,
+                profileNeighbors,
                 HaarDetectionTypes.ScaleImage,
-                minSize);
+                effectiveMinSize);
 
             foreach (var r in profilesFlipped)
             {
-                // Re-mapear las coordenadas al espacio original
                 int origX = grayImage.Cols - (r.X + r.Width);
                 Rect unmirrored = new(origX, r.Y, r.Width, r.Height);
                 candidates.Add(new OrientedFace(unmirrored, FaceOrientation.LookingLeft));
             }
         }
 
-        // 3. Supresión de No-Máximos (NMS) para fusionar rectángulos duplicados sobre la misma persona
-        return NonMaxSuppression(candidates);
+        return NonMaxSuppressionAndBodyFilter(candidates, grayImage.Rows);
     }
 
-    /// <summary>
-    /// Detección clásica de rectángulos compatibles hacia atrás.
-    /// </summary>
     public Rect[] DetectMultiScale(
         Mat image,
         double scaleFactor = 1.1,
@@ -169,23 +151,20 @@ public sealed class FaceDetector : IDisposable
             return Array.Empty<Rect>();
         }
 
-        // Si es una cascada secundaria (ojos, sonrisa) usar llamada directa
         if (_profileCascade is null)
         {
             if (_frontalCascade is null) return Array.Empty<Rect>();
             return _frontalCascade.DetectMultiScale(image, scaleFactor, minNeighbors, flags, minSize, maxSize);
         }
 
-        // Si es el detector de rostros, invocar la detección combinada frontal + perfiles
         var oriented = DetectOrientedFaces(image, scaleFactor, minNeighbors, minSize);
         return oriented.Select(x => x.Bounds).ToArray();
     }
 
-    private static IReadOnlyList<OrientedFace> NonMaxSuppression(List<OrientedFace> faces)
+    private static IReadOnlyList<OrientedFace> NonMaxSuppressionAndBodyFilter(List<OrientedFace> faces, int frameHeight)
     {
-        if (faces.Count <= 1) return faces;
+        if (faces.Count == 0) return faces;
 
-        // Priorizar rostros frontales primero, luego por área descendente
         var sorted = faces
             .OrderByDescending(f => f.Orientation == FaceOrientation.Frontal)
             .ThenByDescending(f => f.Bounds.Width * f.Bounds.Height)
@@ -195,23 +174,48 @@ public sealed class FaceDetector : IDisposable
 
         foreach (var face in sorted)
         {
-            bool overlaps = false;
+            // Descartar detecciones en el tercio inferior de la pantalla (pecho/ropa)
+            if (face.Bounds.Y > frameHeight * 0.68)
+                continue;
+
+            bool reject = false;
             foreach (var existing in merged)
             {
-                if (CalculateIoU(face.Bounds, existing.Bounds) > 0.32)
+                // 1. Solapamiento directo (misma cara)
+                if (CalculateIoU(face.Bounds, existing.Bounds) > 0.25)
                 {
-                    overlaps = true;
+                    reject = true;
+                    break;
+                }
+
+                // 2. Falso positivo en cuello/pecho justo debajo de una cara ya detectada
+                int existingCenterX = existing.Bounds.X + existing.Bounds.Width / 2;
+                int candidateCenterX = face.Bounds.X + face.Bounds.Width / 2;
+                bool alignedVertically = Math.Abs(existingCenterX - candidateCenterX) < existing.Bounds.Width * 0.70;
+                bool isBelow = face.Bounds.Y >= existing.Bounds.Y + existing.Bounds.Height * 0.45;
+
+                if (alignedVertically && isBelow)
+                {
+                    reject = true;
+                    break;
+                }
+
+                // 3. Una segunda persona real tiene un tamaño comparable (al menos 55% del ancho de la primera)
+                if (face.Bounds.Width < existing.Bounds.Width * 0.55)
+                {
+                    reject = true;
                     break;
                 }
             }
 
-            if (!overlaps)
+            if (!reject)
             {
                 merged.Add(face);
             }
         }
 
-        return merged;
+        // Máximo 2 rostros simultáneos (evita ruido múltiple)
+        return merged.Take(2).ToList();
     }
 
     private static double CalculateIoU(Rect a, Rect b)

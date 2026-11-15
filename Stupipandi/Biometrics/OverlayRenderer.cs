@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using OpenCvSharp;
 using Stupipandi.Game;
@@ -8,44 +9,34 @@ using Stupipandi.State;
 
 namespace Stupipandi.Biometrics;
 
-/// <summary>
-/// Motor gráfico de alto rendimiento para renderizar telemetría, realidad aumentada (sombreros AR),
-/// animaciones GIF, video en miniatura (PiP), reemplazo de fondo y elementos interactivos del juego High Noon.
-/// Implementa IDisposable para garantizar la liberación estricta de texturas y matrices nativas.
-/// </summary>
 public sealed class OverlayRenderer : IDisposable
 {
-    private static readonly Scalar ColorRecognized  = new(50, 220, 50);    // Verde esmeralda
-    private static readonly Scalar ColorUnknown     = new(40, 40, 230);    // Rojo carmesí
-    private static readonly Scalar ColorWarning     = new(0, 215, 255);    // Amarillo dorado
-    private static readonly Scalar ColorEye         = new(255, 210, 40);   // Cyan cielo
-    private static readonly Scalar ColorGesture     = new(20, 160, 255);   // Naranja ámbar
-    private static readonly Scalar ColorWhite       = new(255, 255, 255);  // Blanco
-    private static readonly Scalar ColorMuted       = new(190, 190, 190);  // Gris claro
+    private static readonly Scalar ColorRecognized = new(50, 220, 50);
+    private static readonly Scalar ColorUnknown = new(40, 40, 230);
+    private static readonly Scalar ColorWarning = new(0, 215, 255);
+    private static readonly Scalar ColorEye = new(255, 210, 40);
+    private static readonly Scalar ColorGesture = new(20, 160, 255);
+    private static readonly Scalar ColorWhite = new(255, 255, 255);
+    private static readonly Scalar ColorMuted = new(190, 190, 190);
 
     private static readonly string MediaFolder = Path.Combine(AppContext.BaseDirectory, "Assets", "Media");
 
-    // Caché de texturas AR y multimedia
     private readonly Dictionary<string, Mat> _textureCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<Mat> _gifFrames = new();
     private int _gifFrameIndex = 0;
     private long _lastGifFrameTicks = 0;
 
-    // Reproductor de video auxiliar para PiP (Trigger 6: video_1.mp4)
     private VideoCapture? _auxVideoCap;
-    private string? _auxVideoPath;
     private Mat? _auxVideoFrame;
+    private long _auxVideoStartTicks = 0;
+    private double _auxVideoFps = 25.0;
 
-    // Filtros de suavizado EMA para sombreros AR (evitar jitter)
     private Rect? _smoothedHatRect;
     private Rect? _smoothedKippahRect;
     private const double HatAlpha = 0.28;
 
     private bool _disposed;
 
-    /// <summary>
-    /// Dibuja el recuadro facial estabilizado, etiqueta de usuario, confianza, ojos y badges de expresión.
-    /// </summary>
     public void DrawFace(
         Mat frame,
         Rect faceBounds,
@@ -75,13 +66,12 @@ public sealed class OverlayRenderer : IDisposable
         int textY = faceBounds.Y > 28 ? faceBounds.Y - 8 : faceBounds.Y + 24;
         DrawPillText(frame, labelText, new Point(faceBounds.X, textY), mainColor, 0.55);
 
-        // Badge de expresión facial y apertura oral
         if (expression is not null && expression.Expression != FacialExpression.Neutral)
         {
             Scalar expColor = expression.Expression switch
             {
-                FacialExpression.Smiling    => ColorWarning,
-                FacialExpression.Surprised  => ColorEye,
+                FacialExpression.Smiling => ColorWarning,
+                FacialExpression.Surprised => ColorEye,
                 FacialExpression.EyesClosed => ColorMuted,
                 _ => ColorWhite
             };
@@ -103,9 +93,6 @@ public sealed class OverlayRenderer : IDisposable
         }
     }
 
-    /// <summary>
-    /// Dibuja el cuadro estabilizado y la identificación del gesto de mano.
-    /// </summary>
     public void DrawGesture(Mat frame, Rect handBounds, GestureType gesture)
     {
         ArgumentNullException.ThrowIfNull(frame);
@@ -118,15 +105,11 @@ public sealed class OverlayRenderer : IDisposable
         DrawPillText(frame, $"Gesto: {gestureName}", new Point(handBounds.X, textY), ColorGesture, 0.58);
     }
 
-    /// <summary>
-    /// Renderiza el sombrero de vaquero AR con suavizado EMA encima de la cabeza del usuario.
-    /// </summary>
     public void DrawCowboyHat(Mat frame, Rect faceBounds)
     {
         Mat? hat = GetOrLoadTexture("cowboy_hat.png");
         if (hat is null || hat.Empty()) return;
 
-        // Calcular posición geométrica encima de la cabeza
         int hatWidth = (int)(faceBounds.Width * 1.55);
         int hatHeight = (int)(hatWidth * ((double)hat.Height / Math.Max(1, hat.Width)));
         int hatX = faceBounds.X + (faceBounds.Width - hatWidth) / 2;
@@ -134,7 +117,6 @@ public sealed class OverlayRenderer : IDisposable
 
         Rect targetRect = new(hatX, hatY, hatWidth, hatHeight);
 
-        // Suavizado espacial EMA para evitar temblores
         if (_smoothedHatRect.HasValue)
         {
             double sx = HatAlpha * targetRect.X + (1 - HatAlpha) * _smoothedHatRect.Value.X;
@@ -151,9 +133,6 @@ public sealed class OverlayRenderer : IDisposable
         DrawAlphaOverlay(frame, hat, _smoothedHatRect.Value);
     }
 
-    /// <summary>
-    /// Renderiza la Kipá tradicional judía con anclaje suavizado sobre la coronilla del usuario.
-    /// </summary>
     public void DrawKippah(Mat frame, Rect faceBounds)
     {
         Mat? kippah = GetOrLoadTexture("kippah.png");
@@ -182,232 +161,184 @@ public sealed class OverlayRenderer : IDisposable
         DrawAlphaOverlay(frame, kippah, _smoothedKippahRect.Value);
     }
 
-    /// <summary>
-    /// Muestra una imagen overlay centrada en pantalla (Trigger 1: Lion Roar Meme).
-    /// </summary>
     public void DrawMemeOverlay(Mat frame, string filename = "image_84e5ca.jpg")
     {
         Mat? img = GetOrLoadTexture(filename);
         if (img is null || img.Empty()) return;
 
-        int targetW = Math.Min((int)(frame.Cols * 0.45), img.Cols);
-        int targetH = (int)(targetW * ((double)img.Rows / img.Cols));
+        int targetW = Math.Max(40, Math.Min((int)(frame.Cols * 0.45), img.Cols));
+        int targetH = Math.Max(40, (int)(targetW * ((double)img.Rows / Math.Max(1, img.Cols))));
 
-        int x = (frame.Cols - targetW) / 2;
-        int y = frame.Rows - targetH - 40;
+        int x = Math.Max(0, (frame.Cols - targetW) / 2);
+        int y = Math.Max(0, frame.Rows - targetH - 40);
 
         Rect target = ClampRect(new Rect(x, y, targetW, targetH), frame.Cols, frame.Rows);
+        if (target.Width <= 2 || target.Height <= 2) return;
+
         using var resized = new Mat();
         Cv2.Resize(img, resized, new Size(target.Width, target.Height));
+        EnsureBgr3(resized);
 
-        // Marco estilizado
-        Cv2.Rectangle(frame, new Rect(target.X - 3, target.Y - 3, target.Width + 6, target.Height + 6), ColorWarning, 2);
+        Cv2.Rectangle(frame, ClampRect(new Rect(target.X - 3, target.Y - 3, target.Width + 6, target.Height + 6), frame.Cols, frame.Rows), ColorWarning, 2);
         resized.CopyTo(frame[target]);
     }
 
-    /// <summary>
-    /// Renderiza un marco animado de GIF en la esquina superior derecha (Trigger 2: guy-funny.gif).
-    /// </summary>
     public void DrawAnimatedGif(Mat frame, string filename = "guy-funny.gif")
     {
         EnsureGifLoaded(filename);
         if (_gifFrames.Count == 0) return;
 
-        long nowTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-        if (nowTicks - _lastGifFrameTicks > System.Diagnostics.Stopwatch.Frequency / 15) // ~15 FPS
+        long nowTicks = Stopwatch.GetTimestamp();
+        if (nowTicks - _lastGifFrameTicks > Stopwatch.Frequency / 15)
         {
             _gifFrameIndex = (_gifFrameIndex + 1) % _gifFrames.Count;
             _lastGifFrameTicks = nowTicks;
         }
 
         Mat currentFrame = _gifFrames[_gifFrameIndex];
-        int targetW = (int)(frame.Cols * 0.32);
-        int targetH = (int)(targetW * ((double)currentFrame.Rows / Math.Max(1, currentFrame.Cols)));
+        if (currentFrame.Empty()) return;
 
-        int x = frame.Cols - targetW - 20;
+        int targetW = Math.Max(40, (int)(frame.Cols * 0.30));
+        int targetH = Math.Max(40, (int)(targetW * ((double)currentFrame.Rows / Math.Max(1, currentFrame.Cols))));
+
+        int x = Math.Max(0, frame.Cols - targetW - 20);
         int y = 75;
 
         Rect target = ClampRect(new Rect(x, y, targetW, targetH), frame.Cols, frame.Rows);
+        if (target.Width <= 2 || target.Height <= 2) return;
+
         using var resized = new Mat();
         Cv2.Resize(currentFrame, resized, new Size(target.Width, target.Height));
+        EnsureBgr3(resized);
 
-        Cv2.Rectangle(frame, new Rect(target.X - 2, target.Y - 2, target.Width + 4, target.Height + 4), ColorWarning, 2);
+        Cv2.Rectangle(frame, ClampRect(new Rect(target.X - 2, target.Y - 2, target.Width + 4, target.Height + 4), frame.Cols, frame.Rows), ColorWarning, 2);
         resized.CopyTo(frame[target]);
     }
 
-    /// <summary>
-    /// Renderiza un video en Picture-in-Picture en la esquina superior izquierda (Trigger 6: video_1.mp4).
-    /// </summary>
+    public void ResetAuxVideo()
+    {
+        _auxVideoStartTicks = 0;
+        if (_auxVideoCap is not null && _auxVideoCap.IsOpened())
+        {
+            _auxVideoCap.Set(VideoCaptureProperties.PosFrames, 0);
+        }
+    }
+
     public void DrawPictureInPictureVideo(Mat frame, string videoFilename = "video_1.mp4")
     {
         EnsureAuxVideoOpen(videoFilename);
         if (_auxVideoCap is null || !_auxVideoCap.IsOpened()) return;
 
-        _auxVideoFrame ??= new Mat();
-        if (!_auxVideoCap.Read(_auxVideoFrame) || _auxVideoFrame.Empty())
+        long nowTicks = Stopwatch.GetTimestamp();
+        if (_auxVideoStartTicks == 0)
         {
-            // Reiniciar video al inicio en bucle
+            _auxVideoStartTicks = nowTicks;
             _auxVideoCap.Set(VideoCaptureProperties.PosFrames, 0);
-            if (!_auxVideoCap.Read(_auxVideoFrame) || _auxVideoFrame.Empty())
-                return;
         }
 
-        int targetW = (int)(frame.Cols * 0.30);
-        int targetH = (int)(targetW * ((double)_auxVideoFrame.Rows / Math.Max(1, _auxVideoFrame.Cols)));
+        // Sincronizar el fotograma con el tiempo real transcurrido para ir a la par que su audio
+        double elapsedSec = (double)(nowTicks - _auxVideoStartTicks) / Stopwatch.Frequency;
+        int expectedFrame = (int)(elapsedSec * _auxVideoFps);
+        int currentPos = (int)_auxVideoCap.Get(VideoCaptureProperties.PosFrames);
+
+        if (expectedFrame > currentPos + 2)
+        {
+            _auxVideoCap.Set(VideoCaptureProperties.PosFrames, expectedFrame);
+        }
+
+        _auxVideoFrame ??= new Mat();
+        if (expectedFrame >= currentPos || _auxVideoFrame.Empty())
+        {
+            if (!_auxVideoCap.Read(_auxVideoFrame) || _auxVideoFrame.Empty())
+            {
+                _auxVideoStartTicks = nowTicks;
+                _auxVideoCap.Set(VideoCaptureProperties.PosFrames, 0);
+                if (!_auxVideoCap.Read(_auxVideoFrame) || _auxVideoFrame.Empty())
+                    return;
+            }
+        }
+
+        int targetW = Math.Max(40, (int)(frame.Cols * 0.28));
+        int targetH = Math.Max(40, (int)(targetW * ((double)_auxVideoFrame.Rows / Math.Max(1, _auxVideoFrame.Cols))));
         int x = 20;
         int y = 75;
 
         Rect target = ClampRect(new Rect(x, y, targetW, targetH), frame.Cols, frame.Rows);
+        if (target.Width <= 2 || target.Height <= 2) return;
+
         using var resized = new Mat();
         Cv2.Resize(_auxVideoFrame, resized, new Size(target.Width, target.Height));
+        EnsureBgr3(resized);
 
-        Cv2.Rectangle(frame, new Rect(target.X - 2, target.Y - 2, target.Width + 4, target.Height + 4), new Scalar(0, 0, 220), 2);
+        Cv2.Rectangle(frame, ClampRect(new Rect(target.X - 2, target.Y - 2, target.Width + 4, target.Height + 4), frame.Cols, frame.Rows), new Scalar(0, 0, 220), 2);
         resized.CopyTo(frame[target]);
     }
 
-    /// <summary>
-    /// Dibuja la insignia o imagen de Dragonite patriota en la esquina inferior derecha (Trigger 6).
-    /// </summary>
     public void DrawDragoniteOverlay(Mat frame, string filename = "dragonite_espanol.jpeg")
     {
         Mat? img = GetOrLoadTexture(filename);
         if (img is null || img.Empty()) return;
 
-        int targetW = (int)(frame.Cols * 0.28);
-        int targetH = (int)(targetW * ((double)img.Rows / Math.Max(1, img.Cols)));
+        int targetW = Math.Max(40, (int)(frame.Cols * 0.26));
+        int targetH = Math.Max(40, (int)(targetW * ((double)img.Rows / Math.Max(1, img.Cols))));
 
-        int x = frame.Cols - targetW - 20;
-        int y = frame.Rows - targetH - 35;
+        int x = Math.Max(0, frame.Cols - targetW - 20);
+        int y = Math.Max(0, frame.Rows - targetH - 35);
 
         Rect target = ClampRect(new Rect(x, y, targetW, targetH), frame.Cols, frame.Rows);
+        if (target.Width <= 2 || target.Height <= 2) return;
+
         using var resized = new Mat();
         Cv2.Resize(img, resized, new Size(target.Width, target.Height));
+        EnsureBgr3(resized);
 
-        Cv2.Rectangle(frame, new Rect(target.X - 2, target.Y - 2, target.Width + 4, target.Height + 4), ColorWarning, 2);
+        Cv2.Rectangle(frame, ClampRect(new Rect(target.X - 2, target.Y - 2, target.Width + 4, target.Height + 4), frame.Cols, frame.Rows), ColorWarning, 2);
         resized.CopyTo(frame[target]);
     }
 
-    /// <summary>
-    /// Reemplaza el fondo de la cámara por la imagen provista (Trigger 4: jesus_bg.jpg),
-    /// preservando la silueta humana a través de la máscara de piel y contorno corporal.
-    /// </summary>
     public void ReplaceBackground(Mat frame, Mat skinMask, Rect? faceBounds, string bgFilename = "jesus_bg.jpg")
     {
         Mat? bg = GetOrLoadTexture(bgFilename);
-        if (bg is null || bg.Empty()) return;
+        if (bg is null || bg.Empty() || frame.Empty()) return;
 
         using var resizedBg = new Mat();
         Cv2.Resize(bg, resizedBg, new Size(frame.Cols, frame.Rows));
+        EnsureBgr3(resizedBg);
 
-        // Crear máscara humana aproximada combinando la piel con una dilatación moderada
         using var humanMask = new Mat();
         using var kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(25, 25));
         Cv2.Dilate(skinMask, humanMask, kernel, iterations: 2);
 
-        // Si hay rostro detectado, asegurar que el óvalo del rostro y el torso estén incluidos
         if (faceBounds.HasValue)
         {
             var face = faceBounds.Value;
-            // Zona del rostro
             Cv2.Circle(humanMask, new Point(face.X + face.Width / 2, face.Y + face.Height / 2), (int)(face.Width * 0.65), Scalar.White, -1);
-            // Zona del cuello y torso superior
-            var torso = new Rect(
-                Math.Max(0, face.X - (int)(face.Width * 0.40)),
-                face.Bottom,
-                Math.Min(frame.Cols, (int)(face.Width * 1.80)),
-                Math.Min(frame.Rows - face.Bottom, (int)(face.Height * 1.60)));
-            Cv2.Rectangle(humanMask, ClampRect(torso, frame.Cols, frame.Rows), Scalar.White, -1);
-        }
 
-        // Suavizar bordes de la máscara para composición natural
-        Cv2.GaussianBlur(humanMask, humanMask, new Size(21, 21), 0);
-
-        // Composición pixel a pixel con canal de peso
-        unsafe
-        {
-            byte* framePtr = (byte*)frame.Data.ToPointer();
-            byte* bgPtr = (byte*)resizedBg.Data.ToPointer();
-            byte* maskPtr = (byte*)humanMask.Data.ToPointer();
-
-            int totalPixels = frame.Cols * frame.Rows;
-
-            for (int i = 0; i < totalPixels; i++)
+            int torsoX = Math.Max(0, face.X - (int)(face.Width * 0.40));
+            int torsoY = Math.Clamp(face.Bottom, 0, frame.Rows - 1);
+            int torsoW = Math.Clamp((int)(face.Width * 1.80), 1, frame.Cols - torsoX);
+            int torsoH = Math.Clamp((int)(face.Height * 1.60), 1, frame.Rows - torsoY);
+            if (torsoW > 1 && torsoH > 1)
             {
-                byte alpha = maskPtr[i];
-                if (alpha < 240)
-                {
-                    double fgWeight = alpha / 255.0;
-                    double bgWeight = 1.0 - fgWeight;
-
-                    int idx = i * 3;
-                    framePtr[idx + 0] = (byte)(framePtr[idx + 0] * fgWeight + bgPtr[idx + 0] * bgWeight);
-                    framePtr[idx + 1] = (byte)(framePtr[idx + 1] * fgWeight + bgPtr[idx + 1] * bgWeight);
-                    framePtr[idx + 2] = (byte)(framePtr[idx + 2] * fgWeight + bgPtr[idx + 2] * bgWeight);
-                }
+                Cv2.Rectangle(humanMask, new Rect(torsoX, torsoY, torsoW, torsoH), Scalar.White, -1);
             }
         }
+
+        using var bgMask = new Mat();
+        Cv2.BitwiseNot(humanMask, bgMask);
+        resizedBg.CopyTo(frame, bgMask);
     }
 
-    /// <summary>
-    /// Renderiza los elementos interactivos del minijuego High Noon (Trigger 3).
-    /// </summary>
     public void DrawHighNoonGame(Mat frame, HighNoonGameEngine gameEngine, Point? indexFingerTip, Rect? faceBounds)
     {
-        // 1. Título "HIGH NOON" con borde negro
-        string title = "HIGH NOON";
-        var tSize = Cv2.GetTextSize(title, HersheyFonts.HersheyComplex, 1.3, 3, out int baseline);
-        int tx = (frame.Cols - tSize.Width) / 2;
-        int ty = 90;
+        gameEngine.UpdateAndRender(frame, indexFingerTip);
 
-        Cv2.PutText(frame, title, new Point(tx, ty), HersheyFonts.HersheyComplex, 1.3, Scalar.Black, 6, LineTypes.AntiAlias);
-        Cv2.PutText(frame, title, new Point(tx, ty), HersheyFonts.HersheyComplex, 1.3, new Scalar(0, 220, 255), 3, LineTypes.AntiAlias);
-
-        // 2. Sombrero de vaquero en la cabeza
         if (faceBounds.HasValue)
         {
             DrawCowboyHat(frame, faceBounds.Value);
         }
-
-        // 3. Renderizar barriles que caen
-        Mat? barrelTex = GetOrLoadTexture("barrel.png");
-        foreach (var b in gameEngine.ActiveBarrels)
-        {
-            Rect bRect = new((int)(b.X - b.Radius), (int)(b.Y - b.Radius), (int)(b.Radius * 2), (int)(b.Radius * 2));
-            if (barrelTex is not null && !barrelTex.Empty())
-            {
-                DrawAlphaOverlay(frame, barrelTex, bRect);
-            }
-            else
-            {
-                Cv2.Circle(frame, new Point((int)b.X, (int)b.Y), (int)b.Radius, new Scalar(30, 80, 180), -1);
-                Cv2.Circle(frame, new Point((int)b.X, (int)b.Y), (int)b.Radius, new Scalar(60, 140, 240), 2);
-            }
-        }
-
-        // 4. Renderizar partículas de chispas
-        foreach (var p in gameEngine.ActiveParticles)
-        {
-            Cv2.Circle(frame, new Point((int)p.X, (int)p.Y), (int)p.Radius, new Scalar(0, (int)(255 * p.Life), 255), -1);
-        }
-
-        // 5. Renderizar mira técnica en la punta del dedo índice
-        if (indexFingerTip.HasValue)
-        {
-            Point tip = indexFingerTip.Value;
-            Cv2.Circle(frame, tip, 16, new Scalar(0, 255, 255), 2, LineTypes.AntiAlias);
-            Cv2.Circle(frame, tip, 4, new Scalar(0, 0, 255), -1);
-            Cv2.Line(frame, new Point(tip.X - 22, tip.Y), new Point(tip.X + 22, tip.Y), new Scalar(0, 255, 255), 1);
-            Cv2.Line(frame, new Point(tip.X, tip.Y - 22), new Point(tip.X, tip.Y + 22), new Scalar(0, 255, 255), 1);
-        }
-
-        // 6. Marcador de puntuación
-        string scoreText = $"SCORE: {gameEngine.Score}   |   RECORD: {gameEngine.HighScore}";
-        DrawPillText(frame, scoreText, new Point(frame.Cols / 2 - 120, 125), ColorWarning, 0.65);
     }
 
-    /// <summary>
-    /// Renderiza el HUD completo del simulador con barra de telemetría y barra de atajos.
-    /// </summary>
     public void DrawHud(
         Mat frame,
         ApplicationMode mode,
@@ -425,8 +356,7 @@ public sealed class OverlayRenderer : IDisposable
         int frameW = frame.Cols;
         int frameH = frame.Rows;
 
-        // Barra superior
-        var topBar = new Rect(0, 0, frameW, 64);
+        var topBar = new Rect(0, 0, frameW, Math.Min(64, frameH));
         Cv2.Rectangle(frame, topBar, new Scalar(20, 20, 20), -1);
         Cv2.Line(frame, new Point(0, 64), new Point(frameW, 64), new Scalar(60, 60, 60), 1);
 
@@ -462,25 +392,22 @@ public sealed class OverlayRenderer : IDisposable
         Cv2.PutText(frame, subInfo, new Point(14, 50),
             HersheyFonts.HersheySimplex, 0.44, ColorWhite, 1, LineTypes.AntiAlias);
 
-        // Barra inferior
-        var botBar = new Rect(0, frameH - 26, frameW, 26);
+        var botBar = new Rect(0, Math.Max(0, frameH - 26), frameW, Math.Min(26, frameH));
         Cv2.Rectangle(frame, botBar, new Scalar(16, 16, 16), -1);
         Cv2.Line(frame, new Point(0, frameH - 26), new Point(frameW, frameH - 26), new Scalar(50, 50, 50), 1);
 
-        string shortcuts = "ESC/Q: Salir  |  T: Enrolar rostro  |  S: Guardar modelo  |  R: Reiniciar  |  C: Color Piel";
-        Cv2.PutText(frame, shortcuts, new Point(12, frameH - 8),
+        string shortcuts = "ESC/Q: Salir  |  T: Enrolar rostro  |  S: Guardar modelo  |  R: Reiniciar  |  C: Color Piel  |  1-6: Triggers";
+        Cv2.PutText(frame, shortcuts, new Point(12, Math.Max(15, frameH - 8)),
             HersheyFonts.HersheySimplex, 0.40, ColorMuted, 1, LineTypes.AntiAlias);
 
         if (!string.IsNullOrWhiteSpace(activePrompt))
         {
             var pSize = Cv2.GetTextSize(activePrompt, HersheyFonts.HersheySimplex, 0.65, 2, out int pBaseline);
-            var centerRect = new Rect(
+            var centerRect = ClampRect(new Rect(
                 (frameW - pSize.Width) / 2 - 16,
                 (frameH - pSize.Height) / 2 - 16,
                 pSize.Width + 32,
-                pSize.Height + pBaseline + 32);
-
-            centerRect = ClampRect(centerRect, frameW, frameH);
+                pSize.Height + pBaseline + 32), frameW, frameH);
 
             Cv2.Rectangle(frame, centerRect, new Scalar(12, 12, 70), -1);
             Cv2.Rectangle(frame, centerRect, ColorWarning, 2);
@@ -496,62 +423,60 @@ public sealed class OverlayRenderer : IDisposable
         }
     }
 
-    /// <summary>
-    /// Superpone una textura BGRA de 4 canales con canal alfa sobre una región BGR de destino.
-    /// </summary>
     private static void DrawAlphaOverlay(Mat frame, Mat overlayBgra, Rect destRect)
     {
         if (overlayBgra.Empty() || destRect.Width <= 0 || destRect.Height <= 0) return;
 
-        // Limitar coordenadas dentro de los límites del lienzo
         int x0 = Math.Max(0, destRect.X);
         int y0 = Math.Max(0, destRect.Y);
         int x1 = Math.Min(frame.Cols, destRect.Right);
         int y1 = Math.Min(frame.Rows, destRect.Bottom);
 
-        if (x1 <= x0 || y1 <= y0) return;
-
         int renderW = x1 - x0;
         int renderH = y1 - y0;
+        if (renderW <= 0 || renderH <= 0) return;
 
         using var resizedOverlay = new Mat();
         Cv2.Resize(overlayBgra, resizedOverlay, new Size(destRect.Width, destRect.Height));
 
         int srcX = x0 - destRect.X;
         int srcY = y0 - destRect.Y;
+        if (srcX < 0 || srcY < 0 || srcX + renderW > resizedOverlay.Cols || srcY + renderH > resizedOverlay.Rows)
+            return;
+
         using var srcSub = resizedOverlay[new Rect(srcX, srcY, renderW, renderH)];
         using var dstSub = frame[new Rect(x0, y0, renderW, renderH)];
 
-        // Mezcla alfa por píxel
         if (srcSub.Channels() == 4)
         {
-            unsafe
-            {
-                byte* srcPtr = (byte*)srcSub.Data.ToPointer();
-                byte* dstPtr = (byte*)dstSub.Data.ToPointer();
-                int totalPixels = renderW * renderH;
+            Cv2.Split(srcSub, out Mat[] ch);
+            using var b = ch[0];
+            using var g = ch[1];
+            using var r = ch[2];
+            using var alpha = ch[3];
 
-                for (int i = 0; i < totalPixels; i++)
-                {
-                    int srcIdx = i * 4;
-                    int dstIdx = i * 3;
-                    byte a = srcPtr[srcIdx + 3];
+            using var overlayBgr = new Mat();
+            Cv2.Merge(new Mat[] { b, g, r }, overlayBgr);
+            overlayBgr.CopyTo(dstSub, alpha);
 
-                    if (a > 0)
-                    {
-                        double alpha = a / 255.0;
-                        double invAlpha = 1.0 - alpha;
-
-                        dstPtr[dstIdx + 0] = (byte)(srcPtr[srcIdx + 0] * alpha + dstPtr[dstIdx + 0] * invAlpha);
-                        dstPtr[dstIdx + 1] = (byte)(srcPtr[srcIdx + 1] * alpha + dstPtr[dstIdx + 1] * invAlpha);
-                        dstPtr[dstIdx + 2] = (byte)(srcPtr[srcIdx + 2] * alpha + dstPtr[dstIdx + 2] * invAlpha);
-                    }
-                }
-            }
+            foreach (var c in ch) c.Dispose();
         }
         else
         {
+            EnsureBgr3(srcSub);
             srcSub.CopyTo(dstSub);
+        }
+    }
+
+    private static void EnsureBgr3(Mat mat)
+    {
+        if (mat.Channels() == 4)
+        {
+            Cv2.CvtColor(mat, mat, ColorConversionCodes.BGRA2BGR);
+        }
+        else if (mat.Channels() == 1)
+        {
+            Cv2.CvtColor(mat, mat, ColorConversionCodes.GRAY2BGR);
         }
     }
 
@@ -567,7 +492,6 @@ public sealed class OverlayRenderer : IDisposable
 
         try
         {
-            // Intentar cargar con canal alfa si es PNG
             var mode = filename.EndsWith(".png", StringComparison.OrdinalIgnoreCase)
                 ? ImreadModes.Unchanged
                 : ImreadModes.Color;
@@ -627,8 +551,9 @@ public sealed class OverlayRenderer : IDisposable
 
         try
         {
-            _auxVideoPath = path;
             _auxVideoCap = new VideoCapture(path);
+            double fps = _auxVideoCap.Get(VideoCaptureProperties.Fps);
+            _auxVideoFps = fps is > 5 and < 120 ? fps : 25.0;
         }
         catch (Exception ex)
         {
@@ -638,27 +563,26 @@ public sealed class OverlayRenderer : IDisposable
 
     public static string FormatGestureName(GestureType gesture) => gesture switch
     {
-        GestureType.Fist               => "Puno cerrado",
-        GestureType.ThumbsUp           => "Pulgar arriba",
-        GestureType.OneFinger          => "1 Dedo (Indice)",
-        GestureType.TwoFingers         => "2 Dedos (Paz / Victoria)",
-        GestureType.ThreeFingers       => "3 Dedos",
-        GestureType.FourFingers        => "4 Dedos",
-        GestureType.OpenHand           => "Mano abierta (5 dedos)",
-        GestureType.Rock               => "Signo del Rock / Cuernos",
-        GestureType.FingerGun          => "Pistola con dedos (High Noon)",
-        GestureType.PrayingPalms       => "Palmas en Oracion",
+        GestureType.Fist => "Puno cerrado",
+        GestureType.ThumbsUp => "Pulgar arriba",
+        GestureType.OneFinger => "1 Dedo (Indice)",
+        GestureType.TwoFingers => "2 Dedos (Paz / Victoria)",
+        GestureType.ThreeFingers => "3 Dedos",
+        GestureType.FourFingers => "4 Dedos",
+        GestureType.OpenHand => "Mano abierta (5 dedos)",
+        GestureType.Rock => "Signo del Rock / Cuernos",
+        GestureType.FingerGun => "Pistola con dedos (High Noon)",
+        GestureType.PrayingPalms => "Palmas en Oracion",
         GestureType.SteepledFingertips => "Manos en Ojiva (Merkel)",
-        GestureType.MilitarySalute     => "Saludo Militar",
-        GestureType.HandsOnHead        => "Manos en la Cabeza",
-        _                              => "Ninguno"
+        GestureType.MilitarySalute => "Saludo Militar",
+        GestureType.HandsOnHead => "Manos en la Cabeza",
+        _ => "Ninguno"
     };
 
     private static void DrawPillText(Mat frame, string text, Point origin, Scalar color, double fontScale)
     {
         var size = Cv2.GetTextSize(text, HersheyFonts.HersheySimplex, fontScale, 1, out int baseline);
-        var bgRect = new Rect(origin.X - 2, origin.Y - size.Height - 4, size.Width + 6, size.Height + baseline + 6);
-        bgRect = ClampRect(bgRect, frame.Cols, frame.Rows);
+        var bgRect = ClampRect(new Rect(origin.X - 2, origin.Y - size.Height - 4, size.Width + 6, size.Height + baseline + 6), frame.Cols, frame.Rows);
 
         Cv2.Rectangle(frame, bgRect, new Scalar(15, 15, 15), -1);
         Cv2.Rectangle(frame, bgRect, color, 1);
@@ -691,17 +615,16 @@ public sealed class OverlayRenderer : IDisposable
         Cv2.Line(frame, new Point(box.X, box.Bottom), new Point(box.X + cornerLen, box.Bottom), color, t);
         Cv2.Line(frame, new Point(box.X, box.Bottom), new Point(box.X, box.Bottom - cornerLen), color, t);
 
-        // Bottom-Right
         Cv2.Line(frame, new Point(box.Right, box.Bottom), new Point(box.Right - cornerLen, box.Bottom), color, t);
         Cv2.Line(frame, new Point(box.Right, box.Bottom), new Point(box.Right, box.Bottom - cornerLen), color, t);
     }
 
     private static Rect ClampRect(Rect rect, int maxW, int maxH)
     {
-        int x = Math.Clamp(rect.X, 0, maxW - 1);
-        int y = Math.Clamp(rect.Y, 0, maxH - 1);
-        int w = Math.Clamp(rect.Width, 1, maxW - x);
-        int h = Math.Clamp(rect.Height, 1, maxH - y);
+        int x = Math.Clamp(rect.X, 0, Math.Max(0, maxW - 1));
+        int y = Math.Clamp(rect.Y, 0, Math.Max(0, maxH - 1));
+        int w = Math.Clamp(rect.Width, 1, Math.Max(1, maxW - x));
+        int h = Math.Clamp(rect.Height, 1, Math.Max(1, maxH - y));
         return new Rect(x, y, w, h);
     }
 

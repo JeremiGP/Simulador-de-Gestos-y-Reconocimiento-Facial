@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -8,182 +9,196 @@ using System.Threading.Tasks;
 namespace Stupipandi.Infrastructure;
 
 /// <summary>
-/// Gestor de reproducción de audio multiformato (.wav, .mp3) no bloqueante.
-/// Soporta reproducción mediante MCI (winmm.dll) y PlaySound en Windows,
-/// junto con síntesis procedural en memoria para melodías de fallback.
+/// Motor de audio nativo de Windows de latencia cero basado en WMPlayer.OCX (COM in-process).
+/// Permite reproducción individual o simultánea de varias pistas precargadas (ej. vídeo + himno).
 /// </summary>
 public sealed class AudioManager : IDisposable
 {
     private static readonly bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
-    [DllImport("winmm.dll", EntryPoint = "mciSendStringA", CharSet = CharSet.Ansi)]
-    private static extern int MciSendString(string lpstrCommand, StringBuilder? lpstrReturnString, int uReturnLength, IntPtr hwndCallback);
-
-    [DllImport("winmm.dll", EntryPoint = "PlaySound", SetLastError = true, CharSet = CharSet.Auto)]
-    private static extern bool PlaySoundFile(string? pszSound, IntPtr hmod, uint fdwSound);
-
-    [DllImport("winmm.dll", EntryPoint = "PlaySound", SetLastError = true)]
-    private static extern bool PlaySoundBytes(byte[]? ptrToSound, IntPtr hmod, uint fdwSound);
-
-    private const uint SND_ASYNC = 0x0001;
-    private const uint SND_MEMORY = 0x0004;
-    private const uint SND_PURGE = 0x0040;
-    private const uint SND_FILENAME = 0x00020000;
-
-    private string? _activeMciAlias;
+    private readonly Dictionary<string, dynamic> _players = new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource? _stopTimerCts;
     private readonly object _syncLock = new();
     private bool _disposed;
 
     /// <summary>
-    /// Reproduce un archivo de audio (.wav o .mp3) de forma asíncrona y no bloqueante.
-    /// Si se especifica una duración mayor a cero, se detiene automáticamente tras el tiempo indicado.
+    /// Precarga un archivo multimedia (.mp3, .wav, .mp4) en silencio para que no suene al iniciar.
     /// </summary>
-    /// <param name="filePath">Ruta absoluta o relativa del archivo de audio.</param>
-    /// <param name="durationSeconds">Duración en segundos tras la cual se silenciará el audio (0 = hasta finalizar o cancelación manual).</param>
-    public void Play(string filePath, double durationSeconds = 0)
+    public void Preload(string key, string filePath)
+    {
+        if (!IsWindows || string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            return;
+
+        lock (_syncLock)
+        {
+            try
+            {
+                string fullPath = Path.GetFullPath(filePath);
+                Type? wmpType = Type.GetTypeFromProgID("WMPlayer.OCX");
+                if (wmpType is null)
+                {
+                    Console.Error.WriteLine("[AudioManager] WMPlayer.OCX no está disponible en este equipo.");
+                    return;
+                }
+
+                if (_players.TryGetValue(key, out dynamic? oldPlayer))
+                {
+                    try
+                    {
+                        oldPlayer.settings.mute = true;
+                        oldPlayer.controls.stop();
+                        oldPlayer.close();
+                    }
+                    catch { }
+                }
+
+                dynamic player = Activator.CreateInstance(wmpType)!;
+
+                player.settings.autoStart = false;
+                player.settings.mute = true;
+                player.settings.volume = 0;
+                player.URL = fullPath;
+
+                Thread.Sleep(60);
+                player.controls.stop();
+                player.controls.currentPosition = 0;
+
+                _players[key] = player;
+                Console.WriteLine($"[AUDIO PRECARGADO EN SILENCIO] {key} -> {Path.GetFileName(fullPath)}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[AudioManager] Error al precargar '{filePath}': {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reproduce al instante una pista previamente precargada.
+    /// Si stopOthers es false, permite mezclarla simultáneamente con otra pista activa.
+    /// </summary>
+    public void PlayPreloaded(string key, double durationSeconds = 0, bool stopOthers = true)
     {
         lock (_syncLock)
         {
-            StopInternal();
-
-            if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+            if (stopOthers)
             {
+                CancelTimer();
+                StopAllPlayersInternal();
+            }
+
+            if (!_players.TryGetValue(key, out dynamic? player))
+            {
+                Console.Error.WriteLine($"[AudioManager] Clave de audio no precargada: '{key}'");
                 return;
             }
 
-            string ext = Path.GetExtension(filePath).ToLowerInvariant();
-
             try
             {
-                if (IsWindows)
-                {
-                    string alias = "StupipandiAudio_" + Guid.NewGuid().ToString("N");
-                    string shortPath = Path.GetFullPath(filePath);
-
-                    // Utilizar MCI para reproducción (.mp3 o .wav)
-                    int openRes = MciSendString($"open \"{shortPath}\" type mpegvideo alias {alias}", null, 0, IntPtr.Zero);
-                    if (openRes == 0)
-                    {
-                        MciSendString($"play {alias} from 0", null, 0, IntPtr.Zero);
-                        _activeMciAlias = alias;
-                    }
-                    else if (ext == ".wav")
-                    {
-                        PlaySoundFile(shortPath, IntPtr.Zero, SND_ASYNC | SND_FILENAME);
-                    }
-                }
+                player.controls.currentPosition = 0;
+                player.settings.mute = false;
+                player.settings.volume = 100;
+                player.controls.play();
+                Console.WriteLine($"[AUDIO PLAY] Reproduciendo '{key}'");
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"[AudioManager] Error al reproducir '{filePath}': {ex.Message}");
+                Console.Error.WriteLine($"[AudioManager] Error al reproducir '{key}': {ex.Message}");
             }
 
-            if (durationSeconds > 0)
+            if (stopOthers || _stopTimerCts is null)
             {
-                _stopTimerCts = new CancellationTokenSource();
-                var token = _stopTimerCts.Token;
-                Task.Delay(TimeSpan.FromSeconds(durationSeconds), token)
-                    .ContinueWith(_ =>
-                    {
-                        if (!token.IsCancellationRequested)
-                        {
-                            Stop();
-                        }
-                    }, TaskScheduler.Default);
+                ScheduleAutoStop(durationSeconds);
             }
         }
     }
 
     /// <summary>
-    /// Reproduce una secuencia de bytes de formato WAV estándar (PCM) en memoria.
+    /// Reproduce cualquier archivo por ruta (lo precarga en silencio si aún no estaba en memoria).
     /// </summary>
-    public void PlayWavStream(byte[] wavBytes, double durationSeconds = 0)
+    public void Play(string filePath, double durationSeconds = 0, bool stopOthers = true)
     {
-        lock (_syncLock)
+        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
         {
-            StopInternal();
-
-            try
-            {
-                if (IsWindows && wavBytes.Length > 0)
-                {
-                    PlaySoundBytes(wavBytes, IntPtr.Zero, SND_ASYNC | SND_MEMORY);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[AudioManager] Error al reproducir audio en memoria: {ex.Message}");
-            }
-
-            if (durationSeconds > 0)
-            {
-                _stopTimerCts = new CancellationTokenSource();
-                var token = _stopTimerCts.Token;
-                Task.Delay(TimeSpan.FromSeconds(durationSeconds), token)
-                    .ContinueWith(_ =>
-                    {
-                        if (!token.IsCancellationRequested)
-                        {
-                            Stop();
-                        }
-                    }, TaskScheduler.Default);
-            }
+            Console.Error.WriteLine($"[AudioManager] Archivo no encontrado: {filePath}");
+            return;
         }
+
+        string key = Path.GetFileNameWithoutExtension(filePath);
+        if (!_players.ContainsKey(key))
+        {
+            Preload(key, filePath);
+        }
+
+        PlayPreloaded(key, durationSeconds, stopOthers);
     }
 
-    /// <summary>
-    /// Detiene de inmediato cualquier reproducción de audio activa y cancela temporizadores.
-    /// </summary>
+    public void PlayProceduralAnthem(bool isHavaNagila, double durationSeconds, bool stopOthers = true)
+    {
+        byte[] wav = isHavaNagila
+            ? GenerateHavaNagilaFallbackWav((int)Math.Ceiling(durationSeconds))
+            : GenerateHimnoEspanaFallbackWav((int)Math.Ceiling(durationSeconds));
+
+        string key = isHavaNagila ? "fallback_hava" : "fallback_himno";
+        string tempWav = Path.Combine(Path.GetTempPath(), $"stupipandi_{key}.wav");
+        File.WriteAllBytes(tempWav, wav);
+
+        Preload(key, tempWav);
+        PlayPreloaded(key, durationSeconds, stopOthers);
+    }
+
     public void Stop()
     {
         lock (_syncLock)
         {
-            StopInternal();
+            CancelTimer();
+            StopAllPlayersInternal();
         }
     }
 
-    private void StopInternal()
+    private void StopAllPlayersInternal()
+    {
+        foreach (var player in _players.Values)
+        {
+            try
+            {
+                player.settings.mute = true;
+                player.settings.volume = 0;
+                player.controls.stop();
+                player.controls.currentPosition = 0;
+            }
+            catch { }
+        }
+    }
+
+    private void CancelTimer()
     {
         try
         {
             _stopTimerCts?.Cancel();
             _stopTimerCts?.Dispose();
             _stopTimerCts = null;
-
-            if (IsWindows)
-            {
-                PlaySoundFile(null, IntPtr.Zero, SND_PURGE);
-
-                if (_activeMciAlias is not null)
-                {
-                    MciSendString($"stop {_activeMciAlias}", null, 0, IntPtr.Zero);
-                    MciSendString($"close {_activeMciAlias}", null, 0, IntPtr.Zero);
-                    _activeMciAlias = null;
-                }
-            }
         }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[AudioManager] Excepción en parada de audio: {ex.Message}");
-        }
+        catch { }
     }
 
-    /// <summary>
-    /// Genera y reproduce una melodía sintetizada proceduralmente en memoria (fallback si falta el archivo en disco).
-    /// </summary>
-    public void PlayProceduralAnthem(bool isHavaNagila, double durationSeconds)
+    private void ScheduleAutoStop(double durationSeconds)
     {
-        byte[] wav = isHavaNagila
-            ? GenerateHavaNagilaFallbackWav((int)durationSeconds)
-            : GenerateHimnoEspanaFallbackWav((int)durationSeconds);
+        if (durationSeconds <= 0) return;
 
-        PlayWavStream(wav, durationSeconds);
+        CancelTimer();
+        _stopTimerCts = new CancellationTokenSource();
+        var token = _stopTimerCts.Token;
+        Task.Delay(TimeSpan.FromSeconds(durationSeconds), token)
+            .ContinueWith(_ =>
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    Stop();
+                }
+            }, TaskScheduler.Default);
     }
 
-    /// <summary>
-    /// Sintetiza un archivo WAV (PCM 44.1 kHz, 16-bit mono) con la melodía de Hava Nagila.
-    /// </summary>
     public static byte[] GenerateHavaNagilaFallbackWav(int seconds = 6)
     {
         (double Freq, int Ms)[] notes = [
@@ -196,10 +211,7 @@ public sealed class AudioManager : IDisposable
         return SynthesizePcmWav(notes, seconds);
     }
 
-    /// <summary>
-    /// Sintetiza un archivo WAV (PCM 44.1 kHz, 16-bit mono) con la Marcha Real (Himno de España).
-    /// </summary>
-    public static byte[] GenerateHimnoEspanaFallbackWav(int seconds = 8)
+    public static byte[] GenerateHimnoEspanaFallbackWav(int seconds = 9)
     {
         (double Freq, int Ms)[] notes = [
             (261.63, 400), (329.63, 400), (392.00, 600), (329.63, 200), (261.63, 400),
@@ -233,7 +245,7 @@ public sealed class AudioManager : IDisposable
                 double t = (double)i / sampleRate;
                 double envelope = Math.Min(1.0, (double)i / 200.0) * Math.Max(0.0, 1.0 - (double)i / noteSamples);
                 double wave = Math.Sin(2.0 * Math.PI * freq * t) * envelope;
-                audioData[currentSample + i] = (short)(wave * 24000);
+                audioData[currentSample + i] = (short)(wave * 26000);
             }
 
             currentSample += samplesToWrite;
@@ -273,7 +285,19 @@ public sealed class AudioManager : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            StopInternal();
+            CancelTimer();
+
+            foreach (var player in _players.Values)
+            {
+                try
+                {
+                    player.settings.mute = true;
+                    player.controls.stop();
+                    player.close();
+                }
+                catch { }
+            }
+            _players.Clear();
         }
     }
 }
